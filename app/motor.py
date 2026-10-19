@@ -86,6 +86,7 @@ class Motor(QObject):
     concluido = Signal(dict)       # {"modo", "caminhos", "info", "cancelado"}
     falhou = Signal(str)
     carregado = Signal(str)        # id do modelo na placa ("" = nenhum)
+    carregando = Signal(str)       # id do modelo que começou a carregar (leitura do disco)
     placa = Signal(str, str, float)  # nome, backend (CUDA/ROCm/CPU), VRAM total em GB
 
     def __init__(self):
@@ -107,6 +108,8 @@ class Motor(QObject):
         if not config.modelo_instalado(m["id"], excluir=m.get("excluir", ())):
             raise RuntimeError(tr("O modelo {nome} ainda não foi baixado. Baixe na aba Modelos.", nome=m["nome"]))
         self.estado.emit(tr("Abrindo {nome}… (só na primeira vez)", nome=m["nome"]))
+        if not self._pipes:
+            self.carregando.emit(m["id"])
         import diffusers
         import torch
 
@@ -238,6 +241,7 @@ class Motor(QObject):
                 self.placa.emit(nome or "", backend, total)
             elif tipo == "carregar":
                 self._abrir(t.get("modelo", PRINCIPAL["id"]), t.get("modo", "gerar"))
+                self.carregado.emit(self._id or "")  # mesmo se já estava aberto: a tela sai de "carregando"
                 self.estado.emit(tr("Modelo pronto na placa de vídeo"))
             elif tipo == "liberar":
                 self._liberar()

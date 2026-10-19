@@ -411,4 +411,34 @@ _T += [
     ("Depois − antes: {dx:+d} × {dy:+d} px", "After − before: {dx:+d} × {dy:+d} px", "Después − antes: {dx:+d} × {dy:+d} px"),
 ]
 
+_T += [
+    # carregar o modelo antes de gerar
+    ("Carregando {nome}…", "Loading {nome}…", "Cargando {nome}…"),
+    ("Carregar o modelo?", "Load the model?", "¿Cargar el modelo?"),
+    ("O modelo vai para a placa de vídeo uma vez (cerca de 30 s a 1 min). Depois cada imagem sai em poucos segundos. "
+     "Enquanto isso você já pode colar imagens e escrever o prompt.",
+     "The model goes onto the graphics card once (about 30 s to 1 min). After that each image takes a few seconds. "
+     "Meanwhile you can already paste images and write the prompt.",
+     "El modelo se carga en la tarjeta de video una vez (unos 30 s a 1 min). Después cada imagen sale en pocos segundos. "
+     "Mientras tanto ya puedes pegar imágenes y escribir el prompt."),
+    ("Lembrar minha escolha", "Remember my choice", "Recordar mi elección"),
+    ("Agora não", "Not now", "Ahora no"),
+    ("Carregar agora", "Load now", "Cargar ahora"),
+    ("{nome} pronto na placa — pode gerar", "{nome} ready on the GPU — go ahead", "{nome} listo en la tarjeta — ya puedes generar"),
+    ("Carregar o {nome} agora?", "Load {nome} now?", "¿Cargar {nome} ahora?"),
+    ("Carregando o modelo… quando ficar pronto, clique em {acao}.", "Loading the model… when it's ready, click {acao}.",
+     "Cargando el modelo… cuando esté listo, haz clic en {acao}."),
+    ("Carrega {nome} na placa de vídeo (uma vez por sessão). Depois cada imagem sai em segundos.",
+     "Loads {nome} onto the graphics card (once per session). After that each image takes seconds.",
+     "Carga {nome} en la tarjeta de video (una vez por sesión). Después cada imagen sale en segundos."),
+    ("Ao abrir o programa", "When the program opens", "Al abrir el programa"),
+    ("Perguntar se quer carregar o modelo", "Ask whether to load the model", "Preguntar si cargar el modelo"),
+    ("Carregar o modelo sempre", "Always load the model", "Cargar siempre el modelo"),
+    ("Não carregar (carrego quando for usar)", "Don't load (I'll load it when needed)", "No cargar (lo cargo cuando lo use)"),
+    ("Carregando modelo…", "Loading model…", "Cargando modelo…"),
+    ("Carregar modelo", "Load model", "Cargar modelo"),
+    ("Carregando {nome} na placa… (só na abertura)", "Loading {nome} onto the GPU… (only at startup)",
+     "Cargando {nome} en la tarjeta… (solo al abrir)"),
+]
+
 TRADUCOES = {"en": {pt: en for pt, en, _ in _T}, "es": {pt: es for pt, _, es in _T}}

@@ -157,6 +157,8 @@ class PaginaTrabalho(QWidget):
     # ---- comum
     def _ao_trocar_modelo(self, m):
         self.sub_modelo.setText(m["nome"])
+        if hasattr(self, "botao"):
+            self.atualizar_botao()
         self.passos.definir_faixa(1, m["passos_max"])
         self.passos.definir(m["passos"])
         self.guia.setVisible(m.get("usa_guia", False))
@@ -169,6 +171,13 @@ class PaginaTrabalho(QWidget):
         if not config.modelo_instalado(m["id"], excluir=m.get("excluir", ())):
             self.janela.toast(tr("Baixe o modelo {nome} primeiro (aba Modelos).", nome=m["nome"]), "aviso", 4000)
             self.janela.ir_para("modelos")
+            return
+        estado = self.janela.estado_modelo(m["id"])
+        if estado != "pronto":
+            # Só gera com o modelo já na placa: o tempo de carregar fica visível e separado da geração.
+            if estado == "fora":
+                self.janela.carregar_modelo(m, self.modo)
+            self.janela.toast(tr("Carregando o modelo… quando ficar pronto, clique em {acao}.", acao=self.texto_botao), "info", 3500)
             return
         try:
             t = self.montar_tarefa()
@@ -184,8 +193,39 @@ class PaginaTrabalho(QWidget):
     def _clique_botao(self):
         if self.janela.ocupado and self.janela.dono is self:
             self.janela.cancelar()
+            return
+        m = self.seletor.modelo()
+        if self.janela.estado_modelo(m["id"]) == "fora" and config.modelo_instalado(m["id"], excluir=m.get("excluir", ())):
+            self.janela.carregar_modelo(m, self.modo)
         else:
             self.executar()
+
+    def atualizar_botao(self):
+        """O botão principal segue o estado do modelo: Carregar modelo -> Carregando… -> Gerar/Editar."""
+        if self.janela.ocupado and self.janela.dono is self:
+            return
+        m = self.seletor.modelo()
+        estado = self.janela.estado_modelo(m["id"])
+        if estado == "pronto":
+            texto, nome, ativo = self.texto_botao, "principal", True
+        elif estado == "carregando":
+            texto, nome, ativo = tr("Carregando modelo…"), "principal", False
+        else:
+            texto, nome, ativo = tr("Carregar modelo"), "principal", True
+        self.botao.setText(texto)
+        self.botao.setEnabled(ativo)
+        self.botao.setToolTip("" if estado == "pronto" else
+                              tr("Carrega {nome} na placa de vídeo (uma vez por sessão). Depois cada imagem sai em segundos.",
+                                 nome=m["nome"]))
+        if self.botao.objectName() != nome:
+            self.botao.setObjectName(nome)
+            self.botao.style().unpolish(self.botao)
+            self.botao.style().polish(self.botao)
+        if not self.janela.ocupado:
+            carregando = estado == "carregando"
+            self.resultado.visor.definir_ocupado(carregando)
+            if carregando:
+                self.resultado.status(tr("Carregando {nome} na placa… (só na abertura)", nome=m["nome"]))
 
     def ao_comecar(self):
         self.botao.setText(tr("Cancelar"))
@@ -205,11 +245,9 @@ class PaginaTrabalho(QWidget):
         self.resultado.adicionar(caminho)
 
     def ao_fim(self, d=None, erro=None):
-        self.botao.setText(self.texto_botao)
-        self.botao.setObjectName("principal")
-        self.botao.style().unpolish(self.botao)
-        self.botao.style().polish(self.botao)
+        self.botao.setObjectName("")
         self.resultado.ocupado(False)
+        self.atualizar_botao()
         if d:
             self.semente.ultima = d.get("semente")
             self.resultado.status(tr("Cancelado") if d.get("cancelado") else d.get("info", ""))
@@ -1064,9 +1102,19 @@ class PaginaConfig(QWidget):
         cv.setContentsMargins(18, 16, 18, 16)
         cv.setSpacing(8)
         cv.addWidget(rotulo(tr("Placa de vídeo"), "rotulo"))
-        self.pre_carregar = QCheckBox(tr("Carregar o modelo na placa ao abrir o programa (a 1ª imagem sai sem espera)"))
-        self.pre_carregar.setChecked(config.carregar().get("pre_carregar", True))
-        self.pre_carregar.toggled.connect(lambda v: config.salvar({"pre_carregar": v}))
+        self.pre_carregar = QWidget()
+        hp = QHBoxLayout(self.pre_carregar)
+        hp.setContentsMargins(0, 6, 0, 0)
+        hp.addWidget(rotulo(tr("Ao abrir o programa"), "subtitulo"))
+        self.ao_abrir = QComboBox()
+        for cod, texto in (("perguntar", tr("Perguntar se quer carregar o modelo")),
+                           ("sempre", tr("Carregar o modelo sempre")), ("nunca", tr("Não carregar (carrego quando for usar)"))):
+            self.ao_abrir.addItem(texto, cod)
+        atual = config.carregar().get("ao_abrir", "perguntar")
+        self.ao_abrir.setCurrentIndex(max(0, ["perguntar", "sempre", "nunca"].index(atual) if atual in ("perguntar", "sempre", "nunca") else 0))
+        self.ao_abrir.currentIndexChanged.connect(lambda i: config.salvar({"ao_abrir": self.ao_abrir.itemData(i)}))
+        hp.addWidget(self.ao_abrir)
+        hp.addStretch()
         self.placa = rotulo(tr("Verificando…"), "valor")
         self.placa.setStyleSheet("font-size: 14px;")
         cv.addWidget(self.placa)

@@ -180,6 +180,10 @@ class JanelaPrincipal(QMainWindow):
         self.motor.concluido.connect(self._concluido)
         self.motor.falhou.connect(self._falhou)
         self.motor.carregado.connect(self.lateral.modelo_aberto)
+        self.motor.carregado.connect(self._ao_carregado)
+        self.motor.carregando.connect(self._ao_carregando)
+        self.modelo_na_placa = ""
+        self.modelo_carregando = ""
         self.motor.placa.connect(self._placa)
         self._trabalhador = threading.Thread(target=self._laco_motor, name="motor", daemon=True)
         self._trabalhador.start()
@@ -293,7 +297,81 @@ class JanelaPrincipal(QMainWindow):
             if not self.isActiveWindow():
                 QApplication.alert(self)
 
+    # ------------------------------------------------------------ modelo na placa
+    def estado_modelo(self, id_modelo):
+        if getattr(self, "modelo_carregando", "") == id_modelo:
+            return "carregando"
+        return "pronto" if getattr(self, "modelo_na_placa", "") == id_modelo else "fora"
+
+    def carregar_modelo(self, m, modo="gerar"):
+        if self.modelo_carregando:
+            return
+        if not config.modelo_instalado(m["id"], excluir=m.get("excluir", ())):
+            self.toast(tr("Baixe o modelo {nome} primeiro (aba Modelos).", nome=m["nome"]), "aviso", 4000)
+            self.ir_para("modelos")
+            return
+        self.modelo_carregando = m["id"]
+        self.lateral.modelo.setText(tr("Carregando {nome}…", nome=m["nome"]))
+        self._atualizar_botoes()
+        self.pedir({"tipo": "carregar", "modelo": m["id"], "modo": modo})
+
+    def _ao_carregando(self, id_modelo):
+        self.modelo_carregando = id_modelo
+        self._atualizar_botoes()
+
+    def _ao_carregado(self, id_modelo):
+        estava = self.modelo_carregando
+        self.modelo_carregando = ""
+        self.modelo_na_placa = id_modelo
+        self._atualizar_botoes()
+        if id_modelo and estava:
+            self.toast(tr("{nome} pronto na placa — pode gerar", nome=POR_ID[id_modelo]["nome"]), "ok", 3000)
+
+    def _atualizar_botoes(self):
+        for k in ("gerar", "editar", "mascara"):
+            self.paginas[k].atualizar_botao()
+
+    def _perguntar_carregar(self):
+        from PySide6.QtWidgets import QCheckBox, QDialog
+        d = QDialog(self)
+        d.setWindowTitle(tr("Carregar o modelo?"))
+        d.setStyleSheet(f"QDialog {{ background: {tema.PAINEL}; }}")
+        v = QVBoxLayout(d)
+        v.setContentsMargins(24, 22, 24, 20)
+        v.setSpacing(12)
+        v.addWidget(rotulo(tr("Carregar o {nome} agora?", nome=PRINCIPAL["nome"]), "titulo"))
+        txt = rotulo(tr("O modelo vai para a placa de vídeo uma vez (cerca de 30 s a 1 min). Depois cada imagem sai em poucos segundos. "
+                        "Enquanto isso você já pode colar imagens e escrever o prompt."), "subtitulo")
+        txt.setWordWrap(True)
+        v.addWidget(txt)
+        lembrar = QCheckBox(tr("Lembrar minha escolha"))
+        v.addWidget(lembrar)
+        h = QHBoxLayout()
+        h.addStretch()
+        nao = QPushButton(tr("Agora não"))
+        nao.clicked.connect(d.reject)
+        sim = QPushButton(tr("Carregar agora"))
+        sim.setObjectName("principal")
+        sim.setMinimumWidth(170)
+        sim.setDefault(True)
+        sim.clicked.connect(d.accept)
+        h.addWidget(nao)
+        h.addWidget(sim)
+        v.addLayout(h)
+        d.setMinimumWidth(500)
+        tema.barra_titulo_escura(d)
+        ok = d.exec() == QDialog.Accepted
+        if lembrar.isChecked():
+            config.salvar({"ao_abrir": "sempre" if ok else "nunca"})
+            cfg = self.paginas["config"]
+            cfg.ao_abrir.setCurrentIndex(1 if ok else 2)
+        if ok:
+            self.carregar_modelo(PRINCIPAL, "editar")
+
     def _falhou(self, msg):
+        if self.modelo_carregando:
+            self.modelo_carregando = ""
+            self._atualizar_botoes()
         dono, self.ocupado, self.dono = self.dono, False, None
         if dono:
             dono.ao_fim(None, msg)
@@ -310,9 +388,14 @@ class JanelaPrincipal(QMainWindow):
             self.lateral.placa.setText(tr("Sem placa compatível (processador)"))
             self.lateral.vram.hide()
         self.paginas["config"].definir_placa(nome, backend, total)
-        # Já deixa o modelo principal pronto na placa: o primeiro Ctrl+V → Editar não espera a carga.
-        if nome and config.carregar().get("pre_carregar", True) and config.modelo_instalado(PRINCIPAL["id"]):
-            self.pedir({"tipo": "carregar", "modelo": PRINCIPAL["id"], "modo": "editar"})
+        # Carregar o modelo é a parte demorada: na abertura o programa pergunta (ou segue a escolha salva).
+        if config.modelo_instalado(PRINCIPAL["id"]):
+            escolha = config.carregar().get("ao_abrir", "perguntar")
+            if escolha == "sempre":
+                self.carregar_modelo(PRINCIPAL, "editar")
+            elif escolha == "perguntar":
+                QTimer.singleShot(250, self._perguntar_carregar)
+        self._atualizar_botoes()
 
     def _medir_vram(self):
         try:
