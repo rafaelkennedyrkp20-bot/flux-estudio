@@ -519,7 +519,16 @@ class PaginaMascara(PaginaTrabalho):
         self.prompt = CampoPrompt(self.janela.biblioteca, "mascara", tr("O que vai na área pintada"),
                                   tr("Vazio = limpar/remover o que foi pintado"))
         self.col.addWidget(self.prompt)
-        dica = rotulo(tr("Pinte na imagem o que quer trocar ou apagar. O resto fica pixel a pixel igual."), "dica")
+        self.lama = QCheckBox(tr("Pré-preencher com o LaMa de mangá (não inventa pessoas nem membros)"))
+        self.lama.setChecked(True)
+        self.lama.setToolTip(tr("Antes do FLUX, o LaMa continua o fundo da área pintada. O FLUX só refina por cima."))
+        self.col.addWidget(self.lama)
+        self.forca = LinhaSlider(tr("Força"), 2, 20, 20, formato=lambda v: f"{v * 5}%",
+                                 dica=tr("Quanto o FLUX redesenha a área. 100% (padrão): redesenha a partir do fundo já limpo. "
+                                         "Menos: mantém mais do que estava."))
+        self.col.addWidget(self.forca)
+        dica = rotulo(tr("Pinte por cima do que quer trocar ou apagar (pessoa, objeto, texto, marca d'água). "
+                         "Prompt vazio = apagar e completar o fundo. O resto fica pixel a pixel igual."), "dica")
         dica.setWordWrap(True)
         self.col.addWidget(dica)
 
@@ -527,9 +536,6 @@ class PaginaMascara(PaginaTrabalho):
         self.maximo = self._slider_tamanho(tr("Tamanho de trabalho"),
                                            tr("Automático: segue a imagem. O resultado volta ao tamanho original; só a área pintada muda."))
         lay.addWidget(self.maximo)
-        self.forca = LinhaSlider(tr("Força"), 1, 4, 4, formato=lambda v: f"{v * 25}%",
-                                 dica=tr("100% refaz tudo; menos mantém parte do que estava."))
-        lay.addWidget(self.forca)
 
     def _area_direita(self):
         w = QWidget()
@@ -616,7 +622,8 @@ class PaginaMascara(PaginaTrabalho):
         if not self.tela.tem_mascara():
             raise ErroUsuario(tr("Pinte a área que quer refazer."))
         return {"tipo": "mascara", "prompt": self.prompt.texto(), "imagem": qimage_para_pil(self.tela.imagem()),
-                "mascara": self.tela.mascara_pil(), "maximo": self._maximo(self.maximo), "forca": self.forca.valor() / 4}
+                "mascara": self.tela.mascara_pil(), "maximo": self._maximo(self.maximo), "forca": self.forca.valor() / 20,
+                "preencher_lama": self.lama.isChecked()}
 
     def ao_comecar(self):
         super().ao_comecar()
@@ -632,12 +639,222 @@ class PaginaMascara(PaginaTrabalho):
     def prefs_salvar(self, s):
         super().prefs_salvar(s)
         s.setValue("mascara/maximo", self.maximo.valor())
-        s.setValue("mascara/forca", self.forca.valor())
+        s.setValue("mascara/forca3", self.forca.valor())
+        s.setValue("mascara/lama", self.lama.isChecked())
 
     def prefs_carregar(self, s):
         super().prefs_carregar(s)
         self.maximo.definir(int(s.value("mascara/maximo", 7)))
-        self.forca.definir(int(s.value("mascara/forca", 4)))
+        self.forca.definir(int(s.value("mascara/forca3", 20)))
+        self.lama.setChecked(str(s.value("mascara/lama", "true")).lower() == "true")
+
+
+# ================================================================ Limpar (LaMa de mangá)
+class PaginaLimpar(QWidget):
+    """Apagador rápido para texto, balões e marca d'água: só o LaMa de mangá (não precisa do FLUX).
+    Detecta texto/balões sozinho (ou pinte à mão) e limpa em fração de segundo."""
+    modo = "limpar"
+    _detectado = Signal(object, str)
+
+    def __init__(self, janela):
+        super().__init__()
+        self.janela = janela
+        self.texto_botao = tr("Limpar")
+        self._detector = None
+        self._detectado.connect(self._ao_detectar)
+        h = QHBoxLayout(self)
+        h.setContentsMargins(18, 18, 18, 18)
+        h.setSpacing(16)
+        cartao = _cartao()
+        cartao.setFixedWidth(372)
+        v = QVBoxLayout(cartao)
+        v.setContentsMargins(18, 18, 18, 18)
+        v.setSpacing(14)
+        v.addWidget(rotulo(tr("Limpar"), "titulo"))
+        sub = rotulo(tr("Apaga texto, balões e marca d'água e completa o fundo. Rápido e não inventa nada."), "subtitulo")
+        sub.setWordWrap(True)
+        v.addWidget(sub)
+        self.bt_detectar = QPushButton(tr("Detectar texto automaticamente"))
+        self.bt_detectar.setIcon(tema.icone("check", tema.TEXTO, 16))
+        self.bt_detectar.setCursor(Qt.PointingHandCursor)
+        self.bt_detectar.clicked.connect(self._detectar)
+        v.addWidget(self.bt_detectar)
+        self.baloes = QCheckBox(tr("Apagar o balão inteiro, não só o texto"))
+        v.addWidget(self.baloes)
+        dica = rotulo(tr("Confira a marcação: dá para completar com o pincel ou tirar com a borracha (X). "
+                         "Para marca d'água, pinte por cima dela."), "dica")
+        dica.setWordWrap(True)
+        v.addWidget(dica)
+        v.addStretch()
+        self.botao = QPushButton(self.texto_botao)
+        self.botao.setObjectName("principal")
+        self.botao.setCursor(Qt.PointingHandCursor)
+        self.botao.setMinimumHeight(46)
+        self.botao.clicked.connect(self.executar)
+        v.addWidget(self.botao)
+        d = rotulo(tr("Ctrl+Enter executa · Esc cancela · Ctrl+V cola"), "dica")
+        d.setAlignment(Qt.AlignCenter)
+        v.addWidget(d)
+        h.addWidget(cartao)
+
+        self.resultado = PainelResultado(tr("Veja aqui o resultado."), True)
+        self.resultado.enviar.connect(lambda destino, img: self.janela.enviar_para(destino, [img]))
+        self.resultado.continuar.connect(self.continuar)
+        direita = QWidget()
+        dv = QVBoxLayout(direita)
+        dv.setContentsMargins(0, 0, 0, 0)
+        dv.setSpacing(8)
+        barra = QHBoxLayout()
+        barra.setSpacing(4)
+        self.vista = Segmentado([("pintar", tr("Pintar")), ("resultado", tr("Resultado"))], "pintar")
+        self.vista.setFixedWidth(220)
+        self.vista.mudou.connect(self._trocar_vista)
+        barra.addWidget(self.vista)
+        barra.addSpacing(10)
+        self.tela = TelaMascara()
+        self.tela.texto_vazio = tr("Cole a página (Ctrl+V) ou arraste aqui.\nDepois detecte o texto ou pinte o que quer apagar.")
+        self.ferramentas = QWidget()
+        fh = QHBoxLayout(self.ferramentas)
+        fh.setContentsMargins(0, 0, 0, 0)
+        fh.setSpacing(4)
+        fh.addWidget(botao_icone("colar", tr("Colar imagem (Ctrl+V)"), self.janela.colar_aqui))
+        fh.addWidget(botao_icone("abrir", tr("Abrir imagem…"), self._abrir))
+        fh.addSpacing(8)
+        self.bt_pincel = botao_icone("pincel", tr("Pincel (X alterna)"), lambda: self._ferramenta(False), True)
+        self.bt_borracha = botao_icone("borracha", tr("Borracha (X alterna)"), lambda: self._ferramenta(True), True)
+        self.bt_pincel.setChecked(True)
+        fh.addWidget(self.bt_pincel)
+        fh.addWidget(self.bt_borracha)
+        self.tam_pincel = LinhaSlider("", 2, 400, 30)
+        self.tam_pincel.setFixedWidth(150)
+        self.tam_pincel.setToolTip(tr("Tamanho do pincel ( [ e ] ou Alt+roda )"))
+        self.tam_pincel.mudou.connect(lambda v: self.tela.raio != v and self.tela.definir_raio(v))
+        self.tela.pincel_mudou.connect(lambda r: self.tam_pincel.definir(min(400, r)))
+        fh.addWidget(self.tam_pincel)
+        fh.addSpacing(8)
+        fh.addWidget(botao_icone("desfazer", tr("Desfazer (Ctrl+Z)"), self.tela.desfazer))
+        fh.addWidget(botao_icone("limpar", tr("Limpar máscara"), self.tela.limpar))
+        fh.addWidget(botao_icone("ajustar", tr("Ajustar à tela"), self.tela.ajustar))
+        barra.addWidget(self.ferramentas)
+        barra.addStretch()
+        dv.addLayout(barra)
+        self.pilha = QStackedWidget()
+        self.pilha.addWidget(self.tela)
+        self.pilha.addWidget(self.resultado)
+        dv.addWidget(self.pilha, 1)
+        self.tela.mudou.connect(lambda: (self.bt_pincel.setChecked(not self.tela.borracha),
+                                         self.bt_borracha.setChecked(self.tela.borracha)))
+        h.addWidget(direita, 1)
+
+    def _ferramenta(self, borracha):
+        self.tela.borracha = borracha
+        self.bt_pincel.setChecked(not borracha)
+        self.bt_borracha.setChecked(borracha)
+        self.tela.setFocus()
+
+    def _trocar_vista(self, v):
+        self.pilha.setCurrentIndex(0 if v == "pintar" else 1)
+        self.ferramentas.setVisible(v == "pintar")
+
+    def _abrir(self):
+        p, _ = QFileDialog.getOpenFileName(self, tr("Abrir imagem"), "", FILTRO_IMAGENS)
+        if p:
+            self.colar([carregar_qimage(p)])
+
+    def colar(self, imgs):
+        if not imgs or imgs[0] is None or imgs[0].isNull():
+            return
+        img = imgs[0].convertToFormat(QImage.Format_RGB32)
+        self.tela.definir_imagem(img)
+        self.resultado.limpar()
+        self.resultado.mostrar_entrada(img)
+        self.vista.definir("pintar", True)
+
+    def continuar(self, img):
+        self.colar([img])
+        self.janela.toast(tr("Resultado virou a nova imagem base"), "ok")
+
+    # ---- detecção automática (thread do Python: o ONNX roda no processador)
+    def _detectar(self):
+        if not self.tela.tem_imagem():
+            self.janela.toast(tr("Cole ou abra uma imagem primeiro."), "aviso")
+            return
+        self.bt_detectar.setEnabled(False)
+        self.bt_detectar.setText(tr("Detectando…"))
+        img, baloes = qimage_para_pil(self.tela.imagem()), self.baloes.isChecked()
+        import threading
+
+        def trabalho():
+            try:
+                from . import detector
+                if not detector.instalado():
+                    self._detectado.emit(None, tr("Baixando o detector de texto (só na primeira vez)…"))
+                    detector.baixar()
+                if self._detector is None:
+                    self._detector = detector.Detector()
+                self._detectado.emit(self._detector.mascara_texto(img, incluir_baloes=baloes), "")
+            except Exception as e:  # noqa: BLE001
+                self._detectado.emit(None, "erro:" + str(e)[:200])
+        threading.Thread(target=trabalho, daemon=True).start()
+
+    def _ao_detectar(self, mascara, texto):
+        if mascara is None and texto and not texto.startswith("erro:"):
+            self.janela.toast(texto, "info", 4000)
+            return
+        self.bt_detectar.setEnabled(True)
+        self.bt_detectar.setText(tr("Detectar texto automaticamente"))
+        if texto.startswith("erro:"):
+            self.janela.toast(tr("A detecção falhou: {e}", e=texto[5:]), "erro", 6000)
+            return
+        if mascara is None or mascara.getbbox() is None:
+            self.janela.toast(tr("Nenhum texto encontrado. Pinte à mão o que quer apagar."), "aviso")
+            return
+        self.tela.somar_mascara(mascara)
+        self.janela.toast(tr("Texto marcado. Confira e clique em Limpar."), "ok")
+
+    # ---- execução
+    def executar(self):
+        if self.janela.ocupado:
+            return
+        if not self.tela.tem_imagem():
+            self.janela.toast(tr("Cole ou abra uma imagem primeiro."), "aviso")
+            return
+        if not self.tela.tem_mascara():
+            self.janela.toast(tr("Marque o que apagar: Detectar texto ou pinte por cima."), "aviso")
+            return
+        self.janela.rodar({"tipo": "limpar", "imagem": qimage_para_pil(self.tela.imagem()),
+                           "mascara": self.tela.mascara_pil()}, self)
+
+    def ao_comecar(self):
+        self.botao.setEnabled(False)
+        self.resultado.limpar()
+        self.resultado.ocupado(True, tr("Limpando…"))
+        self.vista.definir("resultado", True)
+
+    def ao_estado(self, texto):
+        self.resultado.status(texto)
+
+    def ao_passo(self, feito, total):
+        self.resultado.passo(feito, total)
+
+    def ao_imagem(self, caminho):
+        self.resultado.adicionar(caminho)
+
+    def ao_fim(self, d=None, erro=None):
+        self.botao.setEnabled(True)
+        self.resultado.ocupado(False)
+        if d:
+            self.resultado.status(d.get("info", ""))
+
+    def atualizar_botao(self):
+        pass
+
+    def copiar(self):
+        if self.pilha.currentIndex() == 1:
+            self.resultado.copiar()
+        elif self.tela.tem_imagem():
+            copiar_imagem(self.tela.imagem())
+            self.janela.toast(tr("Imagem copiada — é só colar (Ctrl+V)"), "ok")
 
 
 # ================================================================ Galeria
@@ -1128,6 +1345,25 @@ class PaginaConfig(QWidget):
         cv = QVBoxLayout(c)
         cv.setContentsMargins(18, 16, 18, 16)
         cv.setSpacing(8)
+        cv.addWidget(rotulo(tr("Hugging Face (modelos com termos de uso)"), "rotulo"))
+        exp = rotulo(tr("Alguns modelos (ex.: FLUX.2 klein 9B) só baixam depois que VOCÊ aceita os termos na página do modelo "
+                        "no huggingface.co e cola aqui o seu token de leitura (huggingface.co/settings/tokens). "
+                        "Fica salvo só neste computador."), "dica")
+        exp.setWordWrap(True)
+        cv.addWidget(exp)
+        h = QHBoxLayout()
+        self.token = QLineEdit(config.carregar().get("hf_token", ""))
+        self.token.setEchoMode(QLineEdit.Password)
+        self.token.setPlaceholderText("hf_…")
+        self.token.editingFinished.connect(lambda: config.salvar({"hf_token": self.token.text().strip()}))
+        h.addWidget(self.token, 1)
+        cv.addLayout(h)
+        v.addWidget(c)
+
+        c = _cartao()
+        cv = QVBoxLayout(c)
+        cv.setContentsMargins(18, 16, 18, 16)
+        cv.setSpacing(8)
         cv.addWidget(rotulo(tr("Atualizações"), "rotulo"))
         h = QHBoxLayout()
         h.addWidget(rotulo(tr("Versão {v}", v=instalacao.versao_local(config.BASE)), "valor"))
@@ -1163,7 +1399,7 @@ class PaginaConfig(QWidget):
         for tecla, o_que in (("Ctrl+V", tr("Colar imagem (Photoshop, navegador, Explorer…) na aba atual")),
                              ("Ctrl+C", tr("Copiar o resultado para colar em outro programa")),
                              ("Ctrl+Enter", tr("Gerar / Editar / Refazer")), ("Esc", tr("Cancelar")),
-                             ("C", tr("Comparar antes/depois")), ("Ctrl+1…6", tr("Trocar de aba")),
+                             ("C", tr("Comparar antes/depois")), ("Ctrl+1…7", tr("Trocar de aba")),
                              ("[  ]  ·  Alt+roda", tr("Tamanho do pincel (Máscara)")), ("X", tr("Pincel / borracha")),
                              ("Ctrl+Z", tr("Desfazer pincelada")), (tr("Roda / duplo clique"), tr("Zoom / ajustar ↔ 100%"))):
             h = QHBoxLayout()

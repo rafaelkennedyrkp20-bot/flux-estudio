@@ -17,14 +17,14 @@ from .biblioteca import Biblioteca
 from .i18n import tr
 from .modelos import POR_ID, PRINCIPAL
 from .motor import Motor
-from .paginas import (PaginaConfig, PaginaEditar, PaginaGaleria, PaginaGerar, PaginaMascara, PaginaModelos,
+from .paginas import (PaginaConfig, PaginaLimpar, PaginaEditar, PaginaGaleria, PaginaGerar, PaginaMascara, PaginaModelos,
                       TrabalhoDownload)
 from .widgets import Toast, botao_icone, imagem_do_mime, imagens_do_mime, rotulo
 
 log = logging.getLogger("janela")
 
 ABAS = [("gerar", "Gerar", "gerar"), ("editar", "Editar", "editar"), ("mascara", "Máscara", "mascara"),
-        ("galeria", "Galeria", "galeria"), ("modelos", "Modelos", "modelo"), ("config", "Configurações", "chip")]
+        ("limpar", "Limpar", "borracha"), ("galeria", "Galeria", "galeria"), ("modelos", "Modelos", "modelo"), ("config", "Configurações", "chip")]
 
 
 class BarraLateral(QWidget):
@@ -156,6 +156,7 @@ class JanelaPrincipal(QMainWindow):
 
         self.paginas = {
             "gerar": PaginaGerar(self), "editar": PaginaEditar(self), "mascara": PaginaMascara(self),
+            "limpar": PaginaLimpar(self),
             "galeria": PaginaGaleria(self), "modelos": PaginaModelos(self), "config": PaginaConfig(self),
         }
         for p in self.paginas.values():

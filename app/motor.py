@@ -53,6 +53,13 @@ def tamanho_trabalho(img, m, maximo=None, mult=16):
     return multiplo(w * f, mult), multiplo(h * f, mult)
 
 
+def caixa_trabalho(mascara, margem_rel, minimo):
+    """Caixa em volta da área pintada, com margem de contexto (fração do tamanho da área, ao menos `minimo` px)."""
+    x0, y0, x1, y1 = mascara.getbbox()
+    mg = max(minimo, int(max(x1 - x0, y1 - y0) * margem_rel))
+    return max(0, x0 - mg), max(0, y0 - mg), min(mascara.width, x1 + mg), min(mascara.height, y1 + mg)
+
+
 def corrigir_cores(gerada, original, raio=25):
     """O klein, editando sem máscara, costuma puxar as cores. Devolve a gerada com as cores de
     baixa frequência do original: detalhes da gerada, tom de cada região do original."""
@@ -95,6 +102,7 @@ class Motor(QObject):
         self._pipes = {}           # modo -> pipeline
         self._cache_prompt = {}    # prompt -> embeddings (modo rápido)
         self._rapido = False       # FLUX.2 com transformer morando na placa
+        self._lama = None          # apagador LaMa (carregado no primeiro uso)
         self.cancelar = False
 
     # ---------- modelo ----------
@@ -214,6 +222,9 @@ class Motor(QObject):
         self._pipes.clear()
         self._cache_prompt.clear()
         self._rapido = False
+        if self._lama is not None:
+            self._lama.descarregar()
+            self._lama = None
         self._id = None
         gc.collect()
         try:
@@ -349,23 +360,53 @@ class Motor(QObject):
         self._terminar("editar", caminhos, f"{m['nome']} · {tr('Semente')} {s} · {tam} · {time.time() - t0:.1f} s", s)
 
     def _mascara(self, t):
+        """Refaz só a área pintada. Trabalha num recorte em volta da área (com margem de contexto), em
+        resolução boa mesmo em imagens grandes, e cola de volta só os pixels pintados.
+        O Flux2KleinInpaintPipeline usa a própria imagem de entrada como referência: se ela ainda tem a
+        pessoa/objeto, o modelo desenha de volta (ou duplica). Por isso o LaMa limpa a área ANTES e essa
+        imagem já limpa vira a entrada e a referência; com força 100% o FLUX redesenha a área do zero."""
         fundo = t["imagem"]           # PIL RGB
         mascara = t["mascara"]        # PIL L, mesmo tamanho
         if mascara.getbbox() is None:
             raise RuntimeError(tr("Pinte a área que quer refazer."))
         mascara = mascara.point(lambda v: 255 if v > 10 else 0).filter(ImageFilter.MaxFilter(7))
-        w0, h0 = fundo.size
-        w, h = tamanho_trabalho(fundo, POR_ID.get(t["modelo"], PRINCIPAL), t.get("maximo"))
-        img, msk = fundo.resize((w, h), Image.LANCZOS), mascara.resize((w, h), Image.NEAREST)
+        m = POR_ID.get(t["modelo"], PRINCIPAL)
+        base = fundo
+        if t.get("preencher_lama"):
+            base = self._lama_limpar(fundo, mascara)
+        caixa = caixa_trabalho(mascara, 0.5, 128)
+        rec, rec_m = base.crop(caixa), mascara.crop(caixa)
+        w, h = tamanho_trabalho(rec, m, t.get("maximo"))
+        img, msk = rec.resize((w, h), Image.LANCZOS), rec_m.resize((w, h), Image.NEAREST)
         t = dict(t, prompt=t["prompt"].strip() or PROMPT_LIMPAR)
         m, pipe = self._abrir(t["modelo"], "mascara")
         t0 = time.time()
         geradas, s = self._rodar(m, pipe, t, image=img, mask_image=msk, width=w, height=h, strength=float(t["forca"]))
-        # Volta ao tamanho original e cola só a área pintada: o resto fica pixel a pixel igual.
-        pluma = mascara.filter(ImageFilter.GaussianBlur(3))
+        pluma = rec_m.filter(ImageFilter.GaussianBlur(3))
         caminhos = []
         nome = "limpar" if t["prompt"] == PROMPT_LIMPAR else t["prompt"]
         for g, sk in geradas:
-            final = Image.composite(g.resize((w0, h0), Image.LANCZOS), fundo, pluma)
-            caminhos.append(self._salvar(final, "mascara", nome, sk, self._meta(m, t, forca=t["forca"])))
+            final = fundo.copy()
+            final.paste(Image.composite(g.resize(rec.size, Image.LANCZOS), fundo.crop(caixa), pluma), caixa[:2])
+            caminhos.append(self._salvar(final, "mascara", nome, sk,
+                                         self._meta(m, t, forca=t["forca"], lama=bool(t.get("preencher_lama")))))
         self._terminar("mascara", caminhos, f"{m['nome']} · {tr('Semente')} {s} · {time.time() - t0:.1f} s", s)
+
+    # ---------- LaMa (baixado na primeira vez que for usado) ----------
+    def _lama_limpar(self, imagem, mascara):
+        from . import lama
+        if not lama.instalado():
+            self.estado.emit(tr("Baixando o LaMa de mangá (~200 MB, só na primeira vez)…"))
+            lama.baixar(cancelado=lambda: self.cancelar)
+        if self._lama is None:
+            self._lama = lama.Lama()
+            self._lama.carregar()
+        self.estado.emit(tr("Limpando com o LaMa…"))
+        return self._lama.limpar(imagem, mascara)
+
+    def _limpar(self, t):
+        """Aba Limpar: só o LaMa (rápido, sem o FLUX)."""
+        t0 = time.time()
+        final = self._lama_limpar(t["imagem"], t["mascara"])
+        caminho = self._salvar(final, "limpar", "lama", 0, {"modelo": "LaMa mangá"})
+        self._terminar("limpar", [caminho], f"LaMa · {time.time() - t0:.1f} s", 0)

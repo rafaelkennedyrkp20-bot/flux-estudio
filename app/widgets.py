@@ -413,6 +413,25 @@ class TelaMascara(VisorBase):
             self.update()
             self.mudou.emit()
 
+    def somar_mascara(self, pil_l):
+        """Junta uma máscara PIL (L, mesmo tamanho da imagem) à que já está pintada (ex.: texto detectado)."""
+        if self._mascara is None:
+            return
+        self._guardar()
+        a = pil_l.convert("L").resize((self._mascara.width(), self._mascara.height()))
+        alfa = QImage(a.tobytes(), a.width, a.height, a.width, QImage.Format_Alpha8).copy()
+        cor = QImage(self._mascara.size(), QImage.Format_ARGB32_Premultiplied)
+        cor.fill(QColor(tema.ACENTO))
+        p = QPainter(cor)
+        p.setCompositionMode(QPainter.CompositionMode_DestinationIn)
+        p.drawImage(0, 0, alfa)
+        p.end()
+        p = QPainter(self._mascara)
+        p.drawImage(0, 0, cor)
+        p.end()
+        self.update()
+        self.mudou.emit()
+
     def limpar(self):
         if self._mascara is not None:
             self._guardar()

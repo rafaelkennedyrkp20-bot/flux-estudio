@@ -10,3 +10,4 @@ tokenizers==0.22.2
 PySide6==6.11.1
 requests
 psutil
+onnxruntime==1.23.2
