@@ -325,9 +325,97 @@ def ler_info(pasta):
         return {}
 
 
-def pasta_padrao():
-    """Um disco que não seja o C: com 40 GB livres (o modelo ocupa ~15 GB), senão AppData."""
+_DISCOS = None
+_BUS = {1: "SCSI", 3: "ATA", 7: "USB", 8: "RAID", 10: "SAS", 11: "SATA", 12: "SD", 13: "MMC",
+        15: "Virtual", 16: "Storage Spaces", 17: "NVMe"}
+
+
+def tipos_de_disco():
+    """{"C": {"tipo": "nvme"|"ssd"|"hdd"|"desconhecido", "bus": "NVMe", "livre": bytes}, ...} dos discos fixos.
+
+    Consulta o WMI de armazenamento (MSFT_Partition -> MSFT_PhysicalDisk) por PowerShell uma vez só
+    (~1 s) e guarda o resultado. Nunca levanta exceção: em qualquer falha o tipo fica "desconhecido".
+    """
+    global _DISCOS
+    if _DISCOS is not None:
+        return _DISCOS
     import string
+    discos = {}
+    try:
+        import ctypes
+        tipo_unidade = ctypes.windll.kernel32.GetDriveTypeW
+    except Exception:
+        tipo_unidade = None
+    for letra in string.ascii_uppercase:
+        raiz = f"{letra}:\\"
+        try:
+            if tipo_unidade is not None and tipo_unidade(raiz) != 3:  # DRIVE_FIXED
+                continue
+            livre = shutil.disk_usage(raiz).free
+        except Exception:
+            continue
+        discos[letra] = {"tipo": "desconhecido", "bus": "", "livre": livre}
+    if discos:
+        ns = r"root\Microsoft\Windows\Storage"
+        cmd = ("$ErrorActionPreference='Stop'; "
+               f"$f=@(Get-CimInstance -Namespace {ns} -ClassName MSFT_PhysicalDisk | "
+               "select @{n='Id';e={[string]$_.DeviceId}},@{n='Bus';e={[int]$_.BusType}},@{n='Media';e={[int]$_.MediaType}}); "
+               f"$p=@(Get-CimInstance -Namespace {ns} -ClassName MSFT_Partition | ? {{ [int]$_.DriveLetter -ne 0 }} | "
+               "select @{n='L';e={[string]$_.DriveLetter}},@{n='Disco';e={[string]$_.DiskNumber}}); "
+               "ConvertTo-Json -Compress -InputObject @{f=$f; p=$p}")
+        try:
+            r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", cmd],
+                               capture_output=True, text=True, timeout=3,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            dados = json.loads(r.stdout or "{}")
+            fisicos = {str(f.get("Id")): f for f in (dados.get("f") or []) if isinstance(f, dict)}
+            for part in dados.get("p") or []:
+                letra = str(part.get("L") or "").upper()[:1]
+                f = fisicos.get(str(part.get("Disco")))
+                if letra not in discos or not f:
+                    continue
+                bus, media = f.get("Bus"), f.get("Media")
+                if bus == 17:
+                    tipo = "nvme"
+                elif media == 4:     # SSD
+                    tipo = "ssd"
+                elif media == 3:     # HDD
+                    tipo = "hdd"
+                else:
+                    tipo = "desconhecido"
+                discos[letra].update(tipo=tipo, bus=_BUS.get(bus, str(bus or "")))
+        except Exception:
+            pass
+    _DISCOS = discos
+    return discos
+
+
+def tipo_do_disco(pasta):
+    """Tipo ("nvme"/"ssd"/"hdd"/"desconhecido") do disco onde está `pasta`."""
+    try:
+        letra = os.path.splitdrive(pasta.strip())[0][:1].upper() if pasta and pasta.strip() else ""
+        return tipos_de_disco().get(letra, {}).get("tipo", "desconhecido")
+    except Exception:
+        return "desconhecido"
+
+
+def pasta_padrao():
+    """O disco mais rápido com 40 GB livres (o modelo de ~15 GB é lido do disco a cada abertura):
+    NVMe > SSD SATA > HDD, preferindo um disco que não seja o do sistema. Senão, o disco não-sistema
+    com mais espaço; senão AppData."""
+    import string
+    minimo = 40 * 2**30
+    try:
+        sistema = (os.environ.get("SystemDrive") or "C:")[:1].upper()
+        discos = tipos_de_disco()
+        for tipo in ("nvme", "ssd", "hdd"):
+            ok = [(l, d["livre"]) for l, d in discos.items() if d["tipo"] == tipo and d["livre"] >= minimo]
+            if ok:
+                fora = [x for x in ok if x[0] != sistema]
+                letra = max(fora or ok, key=lambda x: x[1])[0]
+                return os.path.join(f"{letra}:\\", "FluxEstudio")
+    except Exception:
+        pass
     melhor = None
     for letra in string.ascii_uppercase[3:]:
         raiz = f"{letra}:\\"

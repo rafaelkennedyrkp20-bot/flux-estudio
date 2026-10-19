@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QFileDialog, QH
                                QWidget)
 
 from . import config, tema
+from .comparar import DialogoComparar
 from .i18n import tr
 from .modelos import para_modo
 from .widgets import FluxoLayout, TiraMiniaturas, Visor, botao_icone, carregar_qimage, copiar_imagem, rotulo
@@ -274,6 +275,7 @@ class PainelResultado(QWidget):
         self.info.setTextInteractionFlags(Qt.TextSelectableByMouse)
         barra.addWidget(self.info, 1)
         self.bt_comparar = botao_icone("comparar", tr("Comparar antes/depois (passe o mouse) · C"), self._comparar, True)
+        self.bt_janela = botao_icone("lado_a_lado", tr("Abrir comparação antes/depois em janela"), self._abrir_comparacao)
         self.bt_ajustar = botao_icone("ajustar", tr("Ajustar à tela (duplo clique alterna 100%)"), lambda: self.visor.ajustar())
         self.bt_copiar = botao_icone("copiar", tr("Copiar imagem (Ctrl+C) — cola no Photoshop"), self.copiar)
         self.bt_salvar = botao_icone("salvar", tr("Salvar como…"), self._salvar_como)
@@ -282,7 +284,7 @@ class PainelResultado(QWidget):
         self.bt_mascara = botao_icone("mascara", tr("Mandar para Máscara"), lambda: self._enviar("mascara"))
         self.bt_continuar = botao_icone("continuar", tr("Continuar editando este resultado"), self._continuar)
         self._com_continuar = com_continuar
-        for b in (self.bt_comparar, self.bt_ajustar, self.bt_copiar, self.bt_salvar, self.bt_pasta,
+        for b in (self.bt_comparar, self.bt_janela, self.bt_ajustar, self.bt_copiar, self.bt_salvar, self.bt_pasta,
                   self.bt_editar, self.bt_mascara, self.bt_continuar):
             barra.addWidget(b)
         v.addLayout(barra)
@@ -369,7 +371,8 @@ class PainelResultado(QWidget):
         self.bt_pasta.setVisible(tem_res)
         self.bt_continuar.setVisible(tem_res and self._com_continuar)
         self.bt_comparar.setVisible(tem_res and self._entrada is not None)
-        self.bt_comparar.setEnabled(self.bt_comparar.isVisible())
+        self.bt_janela.setVisible(tem_res and self._entrada is not None)
+        self.bt_comparar.setEnabled(tem_res and self._entrada is not None)
         if not self.bt_comparar.isEnabled():
             self.bt_comparar.setChecked(False)
             self.visor.comparar = False
@@ -378,6 +381,12 @@ class PainelResultado(QWidget):
     def _comparar(self):
         self.visor.comparar = self.bt_comparar.isChecked()
         self.visor.update()
+
+    def _abrir_comparacao(self):
+        img, caminho = self.atual()
+        if self._entrada is None or img is None or not self._itens:
+            return
+        DialogoComparar(self._entrada, img, "", os.path.basename(caminho or ""), self.window()).show()
 
     def alternar_comparar(self):
         if self.bt_comparar.isEnabled():

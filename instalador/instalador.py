@@ -143,8 +143,20 @@ class Instalador(QWidget):
         b.clicked.connect(self._procurar)
         h.addWidget(b)
         cv.addLayout(h)
+        h = QHBoxLayout()
+        h.setSpacing(10)
         self.lbl_espaco = _rot("", "dica")
-        cv.addWidget(self.lbl_espaco)
+        self.lbl_espaco.setWordWrap(False)
+        h.addWidget(self.lbl_espaco)
+        self.lbl_disco = _rot("", "dica")
+        self.lbl_disco.setWordWrap(False)
+        h.addWidget(self.lbl_disco)
+        h.addStretch()
+        cv.addLayout(h)
+        self.lbl_disco_aviso = _rot("", "dica")
+        self.lbl_disco_aviso.setStyleSheet(f"color: {tema.AMARELO};")
+        self.lbl_disco_aviso.setVisible(False)
+        cv.addWidget(self.lbl_disco_aviso)
         self.cb_modelo = QCheckBox(tr("Baixar o modelo principal FLUX.2 [klein] 4B agora (~15 GB)"))
         self.cb_modelo.setChecked(True)
         cv.addWidget(self.cb_modelo)
@@ -224,6 +236,7 @@ class Instalador(QWidget):
             self.lbl_espaco.setText(tr("Espaço livre no disco: {gb:.0f} GB (precisa de ~25 GB com o modelo)", gb=livre))
         except OSError:
             self.lbl_espaco.setText("")
+        self._atualizar_disco(pasta)
         if info:
             self._modo = "atualizar"
             self.bt_principal.setText(tr("Atualizar"))
@@ -235,6 +248,24 @@ class Instalador(QWidget):
             self.lbl_existente.setText("")
         for b in (self.bt_desinstalar, self.bt_reparar):
             b.setVisible(bool(info))
+
+    def _atualizar_disco(self, pasta):
+        tipo = inst.tipo_do_disco(pasta)
+        aviso = ""
+        if tipo == "nvme":
+            texto, cor = tr("Disco NVMe ✓"), tema.VERDE
+        elif tipo == "ssd":
+            texto, cor = tr("Disco SSD SATA"), tema.SUAVE
+        elif tipo == "hdd":
+            texto, cor = tr("Disco HDD ⚠"), tema.AMARELO
+            aviso = tr("Disco rígido (HDD): o modelo de ~15 GB é lido do disco toda vez que o programa abre, "
+                       "então vai demorar bastante para carregar. Se puder, escolha uma pasta num SSD.")
+        else:
+            texto, cor = "", tema.SUAVE
+        self.lbl_disco.setText(texto)
+        self.lbl_disco.setStyleSheet(f"color: {cor};")
+        self.lbl_disco_aviso.setText(aviso)
+        self.lbl_disco_aviso.setVisible(bool(aviso))
 
     def _trocar_idioma(self, i):
         i18n._atual = self.idioma.itemData(i)

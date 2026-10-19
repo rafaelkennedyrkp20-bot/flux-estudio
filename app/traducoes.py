@@ -373,4 +373,42 @@ _T += [
      "El programa se instaló, pero la prueba de la tarjeta falló. Detalles:"),
 ]
 
+_T += [
+    # velocidade / pré-carga
+    ("Preparando a placa…", "Warming up the GPU…", "Preparando la tarjeta…"),
+    ("Carregar o modelo na placa ao abrir o programa (a 1ª imagem sai sem espera)",
+     "Load the model onto the GPU when the program opens (the first image comes out without waiting)",
+     "Cargar el modelo en la tarjeta al abrir el programa (la 1.ª imagen sale sin esperar)"),
+    # instalador: tipo de disco
+    ("Disco NVMe ✓", "NVMe drive ✓", "Disco NVMe ✓"),
+    ("Disco SSD SATA", "SATA SSD drive", "Disco SSD SATA"),
+    ("Disco HDD ⚠", "HDD drive ⚠", "Disco HDD ⚠"),
+    ("Disco rígido (HDD): o modelo de ~15 GB é lido do disco toda vez que o programa abre, então vai demorar bastante para carregar. Se puder, escolha uma pasta num SSD.",
+     "Hard drive (HDD): the ~15 GB model is read from disk every time the program opens, so it will take a long time to load. If you can, choose a folder on an SSD.",
+     "Disco duro (HDD): el modelo de ~15 GB se lee del disco cada vez que se abre el programa, así que tardará bastante en cargar. Si puedes, elige una carpeta en un SSD."),
+    # janela de comparação
+    ("Abrir comparação antes/depois em janela", "Open before/after comparison in a window", "Abrir comparación antes/después en una ventana"),
+    ("Comparar com…", "Compare with…", "Comparar con…"),
+    ("Não foi possível abrir a imagem.", "Couldn't open the image.", "No se pudo abrir la imagen."),
+    ("Lado a lado", "Side by side", "Lado a lado"),
+    ("Deslizar", "Slider", "Deslizar"),
+    ("Alternar", "Toggle", "Alternar"),
+    ("Roda: zoom nas duas · arraste para mover · duplo clique: 100%", "Wheel: zoom both · drag to pan · double click: 100%",
+     "Rueda: zoom en las dos · arrastra para mover · doble clic: 100%"),
+    ("Arraste para mover a linha · roda: zoom · botão direito arrasta a imagem", "Drag to move the line · wheel: zoom · right button drags the image",
+     "Arrastra para mover la línea · rueda: zoom · botón derecho arrastra la imagen"),
+    ("Segure Espaço para trocar · roda: zoom · arraste para mover", "Hold Space to switch · wheel: zoom · drag to pan",
+     "Mantén Espacio para cambiar · rueda: zoom · arrastra para mover"),
+    ("Ver antes", "Show before", "Ver antes"),
+    ("Ajustar", "Fit", "Ajustar"),
+    ("Copiar depois", "Copy after", "Copiar después"),
+    ("Fechar", "Close", "Cerrar"),
+    ("Antes", "Before", "Antes"),
+    ("Depois", "After", "Después"),
+    ("Mesmo tamanho", "Same size", "Mismo tamaño"),
+    ("Tamanho diferente · mesma proporção", "Different size · same aspect ratio", "Tamaño diferente · misma proporción"),
+    ("Tamanho diferente · proporção diferente", "Different size · different aspect ratio", "Tamaño diferente · proporción diferente"),
+    ("Depois − antes: {dx:+d} × {dy:+d} px", "After − before: {dx:+d} × {dy:+d} px", "Después − antes: {dx:+d} × {dy:+d} px"),
+]
+
 TRADUCOES = {"en": {pt: en for pt, en, _ in _T}, "es": {pt: es for pt, _, es in _T}}

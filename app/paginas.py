@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxL
 
 from . import config, i18n, instalacao, tema
 from .baixador import Baixador, Cancelado
+from .comparar import DialogoComparar
 from .i18n import tr
 from .modelos import MODELOS, POR_ID
 from .paineis import CampoPrompt, LinhaSemente, PainelResultado, SeletorModelo
@@ -690,6 +691,7 @@ class PaginaGaleria(QWidget):
         acoes.addWidget(botao_icone("editar", tr("Mandar para Editar"), lambda: self._enviar("editar")))
         acoes.addWidget(botao_icone("mascara", tr("Mandar para Máscara"), lambda: self._enviar("mascara")))
         acoes.addWidget(botao_icone("abrir", tr("Mostrar na pasta"), self._mostrar_na_pasta))
+        acoes.addWidget(botao_icone("lado_a_lado", tr("Comparar com…"), self._comparar_com))
         acoes.addStretch()
         acoes.addWidget(botao_icone("lixo", tr("Mandar para a Lixeira"), self._apagar))
         dv.addLayout(acoes)
@@ -801,6 +803,22 @@ class PaginaGaleria(QWidget):
         if p:
             subprocess.Popen(["explorer", "/select,", os.path.normpath(p)])
 
+    def _comparar_com(self):
+        """Escolhe outra imagem (normalmente o original) e abre a comparação: ela é o antes, esta o depois."""
+        p = self._caminho()
+        if not p:
+            return
+        pasta = self.janela.prefs.value("galeria/pasta_comparar", "") or os.path.expanduser("~")
+        outro, _ = QFileDialog.getOpenFileName(self, tr("Comparar com…"), pasta, FILTRO_IMAGENS)
+        if not outro:
+            return
+        self.janela.prefs.setValue("galeria/pasta_comparar", os.path.dirname(outro))
+        antes, depois = carregar_qimage(outro), carregar_qimage(p)
+        if antes.isNull() or depois.isNull():
+            self.janela.toast(tr("Não foi possível abrir a imagem."), "erro")
+            return
+        DialogoComparar(antes, depois, os.path.basename(outro), os.path.basename(p), self.janela).show()
+
     def _apagar(self):
         from PySide6.QtCore import QFile
         p = self._caminho()
@@ -820,6 +838,7 @@ class PaginaGaleria(QWidget):
         m.addAction(tr("Mandar para Editar"), lambda: self._enviar("editar"))
         m.addAction(tr("Mandar para Máscara"), lambda: self._enviar("mascara"))
         m.addAction(tr("Mostrar na pasta"), self._mostrar_na_pasta)
+        m.addAction(tr("Comparar com…"), self._comparar_com)
         m.addSeparator()
         m.addAction(tr("Mandar para a Lixeira"), self._apagar)
         m.exec(self.lista.mapToGlobal(pos))
@@ -1045,12 +1064,16 @@ class PaginaConfig(QWidget):
         cv.setContentsMargins(18, 16, 18, 16)
         cv.setSpacing(8)
         cv.addWidget(rotulo(tr("Placa de vídeo"), "rotulo"))
+        self.pre_carregar = QCheckBox(tr("Carregar o modelo na placa ao abrir o programa (a 1ª imagem sai sem espera)"))
+        self.pre_carregar.setChecked(config.carregar().get("pre_carregar", True))
+        self.pre_carregar.toggled.connect(lambda v: config.salvar({"pre_carregar": v}))
         self.placa = rotulo(tr("Verificando…"), "valor")
         self.placa.setStyleSheet("font-size: 14px;")
         cv.addWidget(self.placa)
         self.placa_dica = rotulo("", "dica")
         self.placa_dica.setWordWrap(True)
         cv.addWidget(self.placa_dica)
+        cv.addWidget(self.pre_carregar)
         v.addWidget(c)
 
         c = _cartao()

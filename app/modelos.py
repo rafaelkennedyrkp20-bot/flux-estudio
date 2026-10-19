@@ -14,7 +14,7 @@ Campos:
 MODELOS = [
     dict(
         id="flux2-klein-4b", nome="FLUX.2 [klein] 4B", repo="black-forest-labs/FLUX.2-klein-4B",
-        principal=True, tipo="flux2", vram=8, lado_auto=1408, gb=15.0, licenca="Apache 2.0",
+        principal=True, tipo="flux2", vram=8, lado_auto=1024, gb=15.0, licenca="Apache 2.0",
         modos=("gerar", "editar", "mascara"), passos=4, passos_max=12, guia=1.0, usa_guia=False,
         dtype="bfloat16",
         classes={"gerar": "Flux2KleinPipeline", "editar": "Flux2KleinPipeline", "mascara": "Flux2KleinInpaintPipeline"},

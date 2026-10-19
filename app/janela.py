@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QComboBox, QGraph
 from . import config, tema
 from .biblioteca import Biblioteca
 from .i18n import tr
-from .modelos import POR_ID
+from .modelos import POR_ID, PRINCIPAL
 from .motor import Motor
 from .paginas import (PaginaConfig, PaginaEditar, PaginaGaleria, PaginaGerar, PaginaMascara, PaginaModelos,
                       TrabalhoDownload)
@@ -183,7 +183,8 @@ class JanelaPrincipal(QMainWindow):
         self.motor.placa.connect(self._placa)
         self._trabalhador = threading.Thread(target=self._laco_motor, name="motor", daemon=True)
         self._trabalhador.start()
-        self.pedir({"tipo": "info"})
+        # Depois que a janela aparece: importar o torch disputa o processador com a montagem da tela.
+        QTimer.singleShot(400, lambda: self.pedir({"tipo": "info"}))
 
         self._monitor = QTimer(self, interval=1500)
         self._monitor.timeout.connect(self._medir_vram)
@@ -269,6 +270,8 @@ class JanelaPrincipal(QMainWindow):
     def _estado(self, texto):
         if self.dono:
             self.dono.ao_estado(texto)
+        else:  # carregando em segundo plano (ao abrir o programa)
+            self.lateral.modelo.setText(texto)
 
     def _passo(self, feito, total):
         if self.dono:
@@ -307,6 +310,9 @@ class JanelaPrincipal(QMainWindow):
             self.lateral.placa.setText(tr("Sem placa compatível (processador)"))
             self.lateral.vram.hide()
         self.paginas["config"].definir_placa(nome, backend, total)
+        # Já deixa o modelo principal pronto na placa: o primeiro Ctrl+V → Editar não espera a carga.
+        if nome and config.carregar().get("pre_carregar", True) and config.modelo_instalado(PRINCIPAL["id"]):
+            self.pedir({"tipo": "carregar", "modelo": PRINCIPAL["id"], "modo": "editar"})
 
     def _medir_vram(self):
         try:

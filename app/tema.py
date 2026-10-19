@@ -161,6 +161,7 @@ _SVG = {
     "desfazer": '<path d="M9 14L4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/>',
     "inverter": '<circle cx="12" cy="12" r="9"/><path d="M12 3v18" /><path d="M12 3a9 9 0 0 1 0 18z" fill="{c}"/>',
     "comparar": '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M12 2v20"/>',
+    "lado_a_lado": '<rect x="2.5" y="5" width="8" height="14" rx="1.5"/><rect x="13.5" y="5" width="8" height="14" rx="1.5"/><path d="M4.5 16l2.5-3 1.5 1.5M15.5 16l2.5-3 1.5 1.5"/>',
     "continuar": '<path d="M5 12h14M13 6l6 6-6 6"/>',
     "ajustar": '<path d="M4 9V5a1 1 0 0 1 1-1h4M15 4h4a1 1 0 0 1 1 1v4M20 15v4a1 1 0 0 1-1 1h-4M9 20H5a1 1 0 0 1-1-1v-4"/>',
     "x": '<path d="M6 6l12 12M18 6L6 18"/>',

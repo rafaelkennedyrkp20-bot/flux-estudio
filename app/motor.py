@@ -58,10 +58,15 @@ def corrigir_cores(gerada, original, raio=25):
     baixa frequência do original: detalhes da gerada, tom de cada região do original."""
     import numpy as np
     from scipy import ndimage
-    o = np.asarray(original.convert("RGB")).astype(np.float32)
-    r = np.asarray(gerada.convert("RGB").resize(original.size, Image.LANCZOS)).astype(np.float32)
-    borrar = lambda x: np.stack([ndimage.gaussian_filter(x[..., c], raio) for c in range(3)], -1)
-    return Image.fromarray(np.clip(r + borrar(o) - borrar(r), 0, 255).astype(np.uint8))
+    gerada = gerada.convert("RGB").resize(original.size, Image.LANCZOS)
+    # A correção é de baixa frequência: calcula em 1/4 da resolução (~15x mais rápido) e amplia.
+    f = 4
+    peq = (max(1, original.width // f), max(1, original.height // f))
+    borrar = lambda im: np.stack([ndimage.gaussian_filter(c, raio / f) for c in
+                                  np.asarray(im.resize(peq, Image.BILINEAR), dtype=np.float32).transpose(2, 0, 1)], -1)
+    dif = borrar(original.convert("RGB")) - borrar(gerada)
+    dif = np.stack([np.asarray(Image.fromarray(dif[..., c]).resize(original.size, Image.BILINEAR)) for c in range(3)], -1)
+    return Image.fromarray(np.clip(np.asarray(gerada, dtype=np.float32) + dif, 0, 255).astype(np.uint8))
 
 
 def info_placa():
@@ -87,6 +92,8 @@ class Motor(QObject):
         super().__init__()
         self._id = None            # modelo aberto
         self._pipes = {}           # modo -> pipeline
+        self._cache_prompt = {}    # prompt -> embeddings (modo rápido)
+        self._rapido = False       # FLUX.2 com transformer morando na placa
         self.cancelar = False
 
     # ---------- modelo ----------
@@ -109,6 +116,19 @@ class Motor(QObject):
         if self._pipes:
             # Mesmo modelo, outro modo: reaproveita os componentes já carregados (sem ler o disco de novo).
             pipe = classe(**next(iter(self._pipes.values())).components)
+            if self._rapido:
+                pipe.set_progress_bar_config(disable=True)
+                self._pipes[modo] = pipe
+                return m, pipe
+        elif m["tipo"] == "flux2" and self._cabe_na_placa():
+            # Abre sempre o pipeline base (gerar/editar) e aquece nele; a máscara reaproveita os componentes.
+            base = self._abrir_flux2_rapido(diffusers.Flux2KleinPipeline, pasta, dtype)
+            self._pipes["gerar"] = self._pipes["editar"] = base
+            self._id = m["id"]
+            log.info("%s aberto (modo rápido) em %.0f s", m["id"], time.time() - t0)
+            self._aquecer(base)
+            self.carregado.emit(m["id"])
+            return self._abrir(id_modelo, modo)
         else:
             kw = dict(torch_dtype=dtype)
             if m.get("variante"):
@@ -127,9 +147,70 @@ class Motor(QObject):
         self.carregado.emit(m["id"])
         return m, pipe
 
+    @staticmethod
+    def _cabe_na_placa():
+        """12 GB+: transformer + VAE moram na placa (modo rápido). Menos que isso: um componente por vez."""
+        import torch
+        return torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memory >= 12 * 2**30
+
+    def _abrir_flux2_rapido(self, classe, pasta, dtype):
+        """Modo rápido do FLUX.2 klein. Antes, a cada imagem ~16 GB iam e voltavam da placa pelo PCIe
+        (12 s/imagem numa 5060 Ti em PCIe 3.0). Agora:
+          - transformer e VAE ficam na placa o tempo todo (bf16, qualidade original);
+          - o codificador de texto (Qwen3) perde as camadas 28-35, que o klein nunca lê (ele usa as saídas
+            9, 18 e 27; o resultado é idêntico bit a bit), e vai para a placa camada por camada, em paralelo
+            com a conta (group offload com streams), a partir de memória fixada (pinned);
+          - o prompt já lido fica guardado (_embeds), então repetir o prompt não usa o codificador.
+        (A atenção cuDNN foi testada: rápida num tamanho fixo, mas a cada tamanho novo de imagem
+        monta planos e chegou a 4-5x mais lenta. A atenção padrão fica estável.)"""
+        import diffusers
+        import torch
+        from diffusers.hooks import apply_group_offloading
+        from transformers import Qwen3ForCausalLM
+
+        te = Qwen3ForCausalLM.from_pretrained(os.path.join(pasta, "text_encoder"), dtype=dtype)
+        te.model.layers = te.model.layers[:28]
+        for p in te.parameters():
+            p.data = p.data.pin_memory()
+        transformer = diffusers.Flux2Transformer2DModel.from_pretrained(
+            os.path.join(pasta, "transformer"), torch_dtype=dtype, device_map="cuda")
+        vae = diffusers.AutoencoderKLFlux2.from_pretrained(os.path.join(pasta, "vae"), torch_dtype=dtype, device_map="cuda")
+        pipe = classe.from_pretrained(pasta, text_encoder=te, transformer=transformer, vae=vae, torch_dtype=dtype)
+        apply_group_offloading(te, onload_device=torch.device("cuda"), offload_type="leaf_level", use_stream=True)
+        pipe.set_progress_bar_config(disable=True)
+        self._rapido = True
+        return pipe
+
+    def _aquecer(self, pipe):
+        """Uma geração mínima logo após abrir: a 1ª imagem de verdade já sai na velocidade normal."""
+        import torch
+        self.estado.emit(tr("Preparando a placa…"))
+        try:
+            with torch.inference_mode():
+                pipe(prompt_embeds=self._embeds(pipe, "warmup"), width=512, height=512, num_inference_steps=1,
+                     guidance_scale=1.0, generator=torch.Generator("cpu").manual_seed(0))
+        except Exception:  # noqa: BLE001 - aquecer é opcional
+            log.warning("aquecimento falhou", exc_info=True)
+
+    def _embeds(self, pipe, prompt):
+        """Prompt -> embeddings, uma vez por prompt (só no modo rápido: com offload por modelo,
+        chamar encode_prompt por fora desmonta os ganchos e fica lento)."""
+        if prompt not in self._cache_prompt:
+            import torch
+            if prompt != "warmup":
+                self.estado.emit(tr("Lendo o prompt…"))
+            with torch.inference_mode():
+                emb = pipe.encode_prompt(prompt, device=pipe._execution_device)[0]
+            if len(self._cache_prompt) >= 32:
+                self._cache_prompt.pop(next(iter(self._cache_prompt)))
+            self._cache_prompt[prompt] = emb
+        return self._cache_prompt[prompt]
+
     def _liberar(self):
         had = bool(self._pipes)
         self._pipes.clear()
+        self._cache_prompt.clear()
+        self._rapido = False
         self._id = None
         gc.collect()
         try:
@@ -151,6 +232,7 @@ class Motor(QObject):
                 # Importa torch/diffusers já na abertura (em segundo plano): a 1ª geração fica mais rápida.
                 import torch
                 import diffusers  # noqa: F401
+                from scipy import ndimage  # noqa: F401 - usado no "acertar as cores"
                 nome, backend = info_placa()
                 total = torch.cuda.get_device_properties(0).total_memory / 2**30 if nome else 0.0
                 self.placa.emit(nome or "", backend, total)
@@ -175,9 +257,11 @@ class Motor(QObject):
         n, passos, prompt = int(t["quantas"]), int(t["passos"]), t["prompt"]
         semente = t.get("semente", -1)
         s = int(semente) if semente is not None and int(semente) >= 0 else random.randint(0, 2**31 - 1)
-        # Sempre pelo prompt: o pipeline cuida de levar cada parte do modelo para a placa e de volta.
-        # (Chamar encode_prompt por fora quebra esse descarregamento: fica lento e vaza memória.)
-        kw["prompt"] = prompt
+        if self._rapido and m["tipo"] == "flux2":
+            kw["prompt_embeds"] = self._embeds(pipe, prompt)
+        else:
+            # Com offload por modelo, sempre pelo prompt: chamar encode_prompt por fora desmonta os ganchos.
+            kw["prompt"] = prompt
         kw["guidance_scale"] = 1.0 if m["tipo"] == "flux2" else float(t.get("guia", m["guia"]))
         params = inspect.signature(pipe.__call__).parameters
         total = n * passos
@@ -248,12 +332,17 @@ class Motor(QObject):
             w, h = tamanho_trabalho(refs[0], m, t.get("maximo"), 8)
             imgs, s = self._rodar(m, pipe, t, image=refs[0].resize((w, h), Image.LANCZOS), image_guidance_scale=1.5)
         caminhos = []
+        auto = not t.get("maximo")
         for im, sk in imgs:
             if t.get("manter_cores"):
                 self.estado.emit(tr("Acertando as cores…"))
                 im = corrigir_cores(im, refs[0])
+            if auto and im.size != refs[0].size:
+                # Automático: devolve exatamente no tamanho da imagem colada (para sobrepor no Photoshop).
+                im = im.resize(refs[0].size, Image.LANCZOS)
             caminhos.append(self._salvar(im, "editar", t["prompt"], sk, self._meta(m, t)))
-        self._terminar("editar", caminhos, f"{m['nome']} · {tr('Semente')} {s} · {w}×{h} · {time.time() - t0:.1f} s", s)
+        tam = f"{refs[0].width}×{refs[0].height}" if auto else f"{w}×{h}"
+        self._terminar("editar", caminhos, f"{m['nome']} · {tr('Semente')} {s} · {tam} · {time.time() - t0:.1f} s", s)
 
     def _mascara(self, t):
         fundo = t["imagem"]           # PIL RGB
