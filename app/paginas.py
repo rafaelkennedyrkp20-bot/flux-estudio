@@ -1,0 +1,1183 @@
+"""As abas do programa."""
+import os
+import shutil
+import subprocess
+import sys
+
+from PySide6.QtCore import QFileSystemWatcher, QObject, QRunnable, QSize, Qt, QThread, QThreadPool, QTimer, Signal
+from PySide6.QtGui import QIcon, QImage, QImageReader, QPixmap
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
+                               QListWidget, QListWidgetItem, QMenu, QMessageBox, QProgressBar, QPushButton,
+                               QScrollArea, QStackedWidget, QVBoxLayout, QWidget)
+
+from . import config, i18n, instalacao, tema
+from .baixador import Baixador, Cancelado
+from .i18n import tr
+from .modelos import MODELOS, POR_ID
+from .paineis import CampoPrompt, LinhaSemente, PainelResultado, SeletorModelo
+from .widgets import (EXT_IMAGEM, LinhaSlider, Recolhivel, Segmentado, TelaMascara, Visor, botao_icone, carregar_qimage,
+                      copiar_imagem, imagens_do_mime, miniatura, qimage_para_pil, rotulo)
+
+FILTRO_IMAGENS = "Imagens (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff)"
+
+
+class ErroUsuario(Exception):
+    pass
+
+
+def _cartao():
+    f = QFrame()
+    f.setObjectName("cartao")
+    return f
+
+
+def _abrir_pasta(p):
+    os.makedirs(p, exist_ok=True)
+    os.startfile(p)
+
+
+def _gb(n):
+    return f"{n / 2**30:.1f} GB"
+
+
+# ================================================================ base das abas de trabalho
+class PaginaTrabalho(QWidget):
+    modo = "gerar"
+    titulo = ""
+    texto_botao = ""
+    texto_vazio = ""
+
+    def __init__(self, janela):
+        super().__init__()
+        self.janela = janela
+        h = QHBoxLayout(self)
+        h.setContentsMargins(18, 18, 18, 18)
+        h.setSpacing(16)
+
+        cartao = _cartao()
+        cartao.setFixedWidth(372)
+        cv = QVBoxLayout(cartao)
+        cv.setContentsMargins(0, 0, 0, 0)
+        cv.setSpacing(0)
+        rolagem = QScrollArea()
+        rolagem.setWidgetResizable(True)
+        rolagem.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        interno = QWidget()
+        self.col = QVBoxLayout(interno)
+        self.col.setContentsMargins(18, 18, 18, 12)
+        self.col.setSpacing(16)
+        rolagem.setWidget(interno)
+        cv.addWidget(rolagem, 1)
+
+        cab = QVBoxLayout()
+        cab.setSpacing(2)
+        cab.addWidget(rotulo(self.titulo, "titulo"))
+        self.sub_modelo = rotulo("", "dica")
+        cab.addWidget(self.sub_modelo)
+        self.col.addLayout(cab)
+
+        # O essencial fica à vista (imagem + prompt + botão). O resto é automático e fica recolhido.
+        self._montar_controles()
+        self.avancado = Recolhivel(tr("Ajustes avançados"))
+        a = self.avancado.lay
+        self.seletor = SeletorModelo(self.modo)
+        self.seletor.mudou.connect(self._ao_trocar_modelo)
+        a.addWidget(self.seletor)
+        self._montar_avancados(a)
+        self.passos = LinhaSlider(tr("Passos"), 1, 12, 4, dica=tr("O FLUX.2 klein foi feito para 4 passos."))
+        self.guia = LinhaSlider(tr("Guia (CFG)"), 0, 150, 60, formato=lambda v: f"{v / 10:.1f}",
+                                dica=tr("Quanto o modelo segue o prompt. Só para alguns modelos."))
+        self.quantas = Segmentado([(i, str(i)) for i in range(1, 5)], 1)
+        q = QVBoxLayout()
+        q.setSpacing(6)
+        q.addWidget(rotulo(tr("Quantas imagens")))
+        q.addWidget(self.quantas)
+        self.semente = LinhaSemente()
+        a.addLayout(q)
+        a.addWidget(self.passos)
+        a.addWidget(self.guia)
+        a.addWidget(self.semente)
+        self._controles_finais(a)
+        self.col.addWidget(self.avancado)
+        self.col.addStretch()
+
+        rodape = QVBoxLayout()
+        rodape.setContentsMargins(18, 10, 18, 18)
+        rodape.setSpacing(6)
+        self.botao = QPushButton(self.texto_botao)
+        self.botao.setObjectName("principal")
+        self.botao.setCursor(Qt.PointingHandCursor)
+        self.botao.setMinimumHeight(46)
+        self.botao.clicked.connect(self._clique_botao)
+        rodape.addWidget(self.botao)
+        dica = rotulo(tr("Ctrl+Enter executa · Esc cancela · Ctrl+V cola"), "dica")
+        dica.setAlignment(Qt.AlignCenter)
+        rodape.addWidget(dica)
+        cv.addLayout(rodape)
+        h.addWidget(cartao)
+
+        self.resultado = PainelResultado(self.texto_vazio, self.modo != "gerar")
+        self.resultado.enviar.connect(lambda destino, img: self.janela.enviar_para(destino, [img]))
+        self.resultado.continuar.connect(self.continuar)
+        h.addWidget(self._area_direita(), 1)
+        self._ao_trocar_modelo(self.seletor.modelo())
+
+    # ---- ganchos das subclasses
+    def _montar_controles(self):
+        pass
+
+    def _montar_avancados(self, lay):
+        pass
+
+    def _controles_finais(self, lay):
+        pass
+
+    @staticmethod
+    def _slider_tamanho(titulo, dica):
+        """7 = Automático (segue a imagem de entrada); 8..32 = lado maior fixo em múltiplos de 64 px."""
+        return LinhaSlider(titulo, 7, 32, 7, formato=lambda v: tr("Automático") if v == 7 else f"{v * 64}px", dica=dica)
+
+    @staticmethod
+    def _maximo(slider):
+        return None if slider.valor() == 7 else slider.valor() * 64
+
+    def _area_direita(self):
+        return self.resultado
+
+    def montar_tarefa(self):
+        raise NotImplementedError
+
+    def colar(self, imgs):
+        pass
+
+    def continuar(self, img):
+        self.colar([img])
+
+    # ---- comum
+    def _ao_trocar_modelo(self, m):
+        self.sub_modelo.setText(m["nome"])
+        self.passos.definir_faixa(1, m["passos_max"])
+        self.passos.definir(m["passos"])
+        self.guia.setVisible(m.get("usa_guia", False))
+        self.guia.definir(int(m["guia"] * 10))
+
+    def executar(self):
+        if self.janela.ocupado:
+            return
+        m = self.seletor.modelo()
+        if not config.modelo_instalado(m["id"], excluir=m.get("excluir", ())):
+            self.janela.toast(tr("Baixe o modelo {nome} primeiro (aba Modelos).", nome=m["nome"]), "aviso", 4000)
+            self.janela.ir_para("modelos")
+            return
+        try:
+            t = self.montar_tarefa()
+        except ErroUsuario as e:
+            self.janela.toast(str(e), "aviso")
+            return
+        t.update(modelo=m["id"], passos=self.passos.valor(), quantas=self.quantas.valor(),
+                 semente=self.semente.valor(), guia=self.guia.valor() / 10)
+        if t.get("prompt"):
+            self.janela.biblioteca.lembrar(self.modo, t["prompt"])
+        self.janela.rodar(t, self)
+
+    def _clique_botao(self):
+        if self.janela.ocupado and self.janela.dono is self:
+            self.janela.cancelar()
+        else:
+            self.executar()
+
+    def ao_comecar(self):
+        self.botao.setText(tr("Cancelar"))
+        self.botao.setObjectName("perigo")
+        self.botao.style().unpolish(self.botao)
+        self.botao.style().polish(self.botao)
+        self.resultado.limpar()
+        self.resultado.ocupado(True, tr("Preparando…"))
+
+    def ao_estado(self, texto):
+        self.resultado.status(texto)
+
+    def ao_passo(self, feito, total):
+        self.resultado.passo(feito, total)
+
+    def ao_imagem(self, caminho):
+        self.resultado.adicionar(caminho)
+
+    def ao_fim(self, d=None, erro=None):
+        self.botao.setText(self.texto_botao)
+        self.botao.setObjectName("principal")
+        self.botao.style().unpolish(self.botao)
+        self.botao.style().polish(self.botao)
+        self.resultado.ocupado(False)
+        if d:
+            self.semente.ultima = d.get("semente")
+            self.resultado.status(tr("Cancelado") if d.get("cancelado") else d.get("info", ""))
+        elif erro:
+            self.resultado.status("")
+
+    def copiar(self):
+        self.resultado.copiar()
+
+    def prefs_salvar(self, s):
+        s.setValue(f"{self.modo}/modelo", self.seletor.modelo()["id"])
+        s.setValue(f"{self.modo}/prompt", self.prompt.texto())
+        s.setValue(f"{self.modo}/quantas", self.quantas.valor())
+        s.setValue(f"{self.modo}/avancado", self.avancado.aberto())
+
+    def prefs_carregar(self, s):
+        self.seletor.definir(s.value(f"{self.modo}/modelo", "flux2-klein-4b"))
+        self.prompt.definir(s.value(f"{self.modo}/prompt", "") or "")
+        self.quantas.definir(int(s.value(f"{self.modo}/quantas", 1)))
+        self.avancado.abrir(str(s.value(f"{self.modo}/avancado", "false")).lower() == "true", False)
+
+
+# ================================================================ Gerar
+PROPORCOES = [("1:1", 1, 1), ("4:5", 4, 5), ("3:4", 3, 4), ("2:3", 2, 3), ("9:16", 9, 16), ("3:2", 3, 2), ("16:9", 16, 9)]
+
+
+class PaginaGerar(PaginaTrabalho):
+    modo = "gerar"
+
+    def __init__(self, janela):
+        self.titulo = tr("Gerar")
+        self.texto_botao = tr("Gerar")
+        self.texto_vazio = tr("Descreva a imagem e clique em Gerar.\n\nCole uma imagem (Ctrl+V) para editá-la.")
+        super().__init__(janela)
+
+    def _montar_controles(self):
+        self.prompt = CampoPrompt(self.janela.biblioteca, "gerar", tr("O que gerar"),
+                                  tr("Ex.: menina de cabelo rosa num café à noite, estilo webtoon, luz de neon"))
+        self.col.addWidget(self.prompt)
+        v = QVBoxLayout()
+        v.setSpacing(6)
+        v.addWidget(rotulo(tr("Proporção")))
+        self.proporcao = Segmentado([(p[0], p[0]) for p in PROPORCOES], "1:1")
+        self.proporcao.mudou.connect(lambda _: self._atualizar_tamanho())
+        v.addWidget(self.proporcao)
+        self.tamanho_txt = rotulo("", "dica")
+        v.addWidget(self.tamanho_txt)
+        self.col.addLayout(v)
+
+    def _montar_avancados(self, lay):
+        self.lado = LinhaSlider(tr("Tamanho (lado maior)"), 8, 24, 16, formato=lambda v: f"{v * 64}px")
+        self.lado.mudou.connect(lambda _: self._atualizar_tamanho())
+        lay.addWidget(self.lado)
+        self._atualizar_tamanho()
+
+    def _dimensoes(self):
+        _, a, b = next(p for p in PROPORCOES if p[0] == self.proporcao.valor())
+        lado = self.lado.valor() * 64
+        if a >= b:
+            w, h = lado, lado * b / a
+        else:
+            w, h = lado * a / b, lado
+        return int(round(w / 16)) * 16, int(round(h / 16)) * 16
+
+    def _atualizar_tamanho(self):
+        if hasattr(self, "lado"):
+            w, h = self._dimensoes()
+            self.tamanho_txt.setText(f"{w} × {h} px")
+
+    def montar_tarefa(self):
+        if not self.prompt.texto():
+            raise ErroUsuario(tr("Escreva o que quer gerar."))
+        w, h = self._dimensoes()
+        return {"tipo": "gerar", "prompt": self.prompt.texto(), "largura": w, "altura": h}
+
+    def colar(self, imgs):
+        self.janela.enviar_para("editar", imgs)
+
+    def prefs_salvar(self, s):
+        super().prefs_salvar(s)
+        s.setValue("gerar/proporcao", self.proporcao.valor())
+        s.setValue("gerar/lado", self.lado.valor())
+
+    def prefs_carregar(self, s):
+        super().prefs_carregar(s)
+        self.proporcao.definir(s.value("gerar/proporcao", "1:1"))
+        self.lado.definir(int(s.value("gerar/lado", 16)))
+        self._atualizar_tamanho()
+
+
+# ================================================================ Editar
+class ListaReferencias(QListWidget):
+    """Imagens de referência: a 1ª é a imagem editada; as outras dão estilo/objetos/rostos.
+    Arraste para reordenar, Delete remove."""
+    mudou = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.setViewMode(QListWidget.IconMode)
+        self.setFlow(QListWidget.LeftToRight)
+        self.setWrapping(True)
+        self.setIconSize(QSize(92, 92))
+        self.setGridSize(QSize(102, 102))
+        self.setMovement(QListWidget.Snap)
+        self.setDragDropMode(QListWidget.InternalMove)
+        self.setDefaultDropAction(Qt.MoveAction)
+        self.setFixedHeight(112)
+        self.setResizeMode(QListWidget.Adjust)
+        self.setStyleSheet(f"QListWidget {{ background: {tema.CARTAO}; border: 1px dashed {tema.BORDA2}; border-radius: 12px; }}")
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._menu)
+        self.model().rowsMoved.connect(lambda *a: self.mudou.emit())
+        self._imgs = {}
+
+    def adicionar(self, img):
+        it = QListWidgetItem()
+        it.setIcon(QIcon(miniatura(img, 184)))
+        it.setToolTip(f"{img.width()} × {img.height()}")
+        chave = id(it)
+        it.setData(Qt.UserRole, chave)
+        self._imgs[chave] = img
+        self.addItem(it)
+        self.setFixedHeight(112 if self.count() <= 3 else 214)
+        self.mudou.emit()
+
+    def substituir_primeira(self, img):
+        if self.count() == 0:
+            self.adicionar(img)
+            return
+        it = self.item(0)
+        self._imgs[it.data(Qt.UserRole)] = img
+        it.setIcon(QIcon(miniatura(img, 184)))
+        self.mudou.emit()
+
+    def imagens(self):
+        return [self._imgs[self.item(i).data(Qt.UserRole)] for i in range(self.count())]
+
+    def remover_selecionadas(self):
+        for it in self.selectedItems():
+            self._imgs.pop(it.data(Qt.UserRole), None)
+            self.takeItem(self.row(it))
+        self.mudou.emit()
+
+    def limpar(self):
+        self.clear()
+        self._imgs.clear()
+        self.setFixedHeight(112)
+        self.mudou.emit()
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            self.remover_selecionadas()
+        else:
+            super().keyPressEvent(e)
+
+    def _menu(self, pos):
+        it = self.itemAt(pos)
+        if not it:
+            return
+        m = QMenu(self)
+        m.addAction(tr("Copiar"), lambda: copiar_imagem(self._imgs[it.data(Qt.UserRole)]))
+        m.addAction(tr("Tornar a principal"), lambda: (self.insertItem(0, self.takeItem(self.row(it))), self.mudou.emit()))
+        m.addAction(tr("Remover"), lambda: (self.setCurrentItem(it), self.remover_selecionadas()))
+        m.exec(self.mapToGlobal(pos))
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        if self.count() == 0:
+            from PySide6.QtGui import QColor, QPainter
+            p = QPainter(self.viewport())
+            p.setPen(QColor(tema.APAGADO))
+            p.drawText(self.viewport().rect(), Qt.AlignCenter, tr("Ctrl+V para colar · ou arraste imagens aqui"))
+            p.end()
+
+
+class PaginaEditar(PaginaTrabalho):
+    modo = "editar"
+
+    def __init__(self, janela):
+        self.titulo = tr("Editar")
+        self.texto_botao = tr("Editar")
+        self.texto_vazio = tr("Cole a imagem (Ctrl+V) — direto do Photoshop, navegador ou pasta — ou arraste aqui.")
+        super().__init__(janela)
+
+    def _montar_controles(self):
+        v = QVBoxLayout()
+        v.setSpacing(6)
+        topo = QHBoxLayout()
+        topo.setSpacing(2)
+        topo.addWidget(rotulo(tr("Imagens de referência")))
+        topo.addStretch()
+        topo.addWidget(botao_icone("colar", tr("Colar (Ctrl+V)"), self.janela.colar_aqui, tamanho=16))
+        topo.addWidget(botao_icone("abrir", tr("Abrir arquivos…"), self._abrir, tamanho=16))
+        topo.addWidget(botao_icone("limpar", tr("Remover todas"), lambda: self.refs.limpar(), tamanho=16))
+        v.addLayout(topo)
+        self.refs = ListaReferencias()
+        self.refs.mudou.connect(self._refs_mudaram)
+        v.addWidget(self.refs)
+        v.addWidget(rotulo(tr("A 1ª é a imagem editada; as outras servem de referência."), "dica"))
+        self.col.addLayout(v)
+        self.prompt = CampoPrompt(self.janela.biblioteca, "editar", tr("O que mudar"),
+                                  tr("Ex.: troque o fundo por uma praia ao pôr do sol, mantenha a personagem igual"))
+        self.col.addWidget(self.prompt)
+        dica = rotulo(tr("Dica: para tirar marca d'água sem mexer no resto, use a aba Máscara."), "dica")
+        dica.setWordWrap(True)
+        self.col.addWidget(dica)
+
+    def _montar_avancados(self, lay):
+        self.maximo = self._slider_tamanho(tr("Tamanho de trabalho"),
+                                           tr("Automático: segue a proporção e o tamanho da imagem colada."))
+        lay.addWidget(self.maximo)
+
+    def _controles_finais(self, lay):
+        self.manter_cores = QCheckBox(tr("Manter as cores do original"))
+        self.manter_cores.setChecked(True)
+        self.manter_cores.setToolTip(tr("Editando sem máscara o modelo puxa o tom. Isto devolve as cores do original."))
+        lay.addWidget(self.manter_cores)
+
+    def _refs_mudaram(self):
+        imgs = self.refs.imagens()
+        self.resultado.mostrar_entrada(imgs[0] if imgs else None)
+
+    def _abrir(self):
+        ps, _ = QFileDialog.getOpenFileNames(self, tr("Abrir imagens"), "", FILTRO_IMAGENS)
+        self.colar([carregar_qimage(p) for p in ps])
+
+    def colar(self, imgs):
+        for img in imgs:
+            if img is not None and not img.isNull():
+                self.refs.adicionar(img)
+
+    def continuar(self, img):
+        self.refs.substituir_primeira(img)
+        self.resultado.limpar()
+        self.resultado.mostrar_entrada(img)
+        self.janela.toast(tr("Resultado virou a nova imagem base"), "ok")
+
+    def montar_tarefa(self):
+        imgs = self.refs.imagens()
+        if not imgs:
+            raise ErroUsuario(tr("Cole ou abra pelo menos uma imagem."))
+        if not self.prompt.texto():
+            raise ErroUsuario(tr("Diga o que mudar na imagem."))
+        return {"tipo": "editar", "prompt": self.prompt.texto(), "referencias": [qimage_para_pil(i) for i in imgs],
+                "maximo": self._maximo(self.maximo), "manter_cores": self.manter_cores.isChecked()}
+
+    def prefs_salvar(self, s):
+        super().prefs_salvar(s)
+        s.setValue("editar/maximo", self.maximo.valor())
+        s.setValue("editar/cores", self.manter_cores.isChecked())
+
+    def prefs_carregar(self, s):
+        super().prefs_carregar(s)
+        self.maximo.definir(int(s.value("editar/maximo", 7)))
+        self.manter_cores.setChecked(str(s.value("editar/cores", "true")).lower() == "true")
+
+
+# ================================================================ Máscara
+class PaginaMascara(PaginaTrabalho):
+    modo = "mascara"
+
+    def __init__(self, janela):
+        self.titulo = tr("Máscara")
+        self.texto_botao = tr("Refazer área pintada")
+        self.texto_vazio = tr("Veja aqui o resultado.")
+        super().__init__(janela)
+
+    def _montar_controles(self):
+        self.prompt = CampoPrompt(self.janela.biblioteca, "mascara", tr("O que vai na área pintada"),
+                                  tr("Vazio = limpar/remover o que foi pintado"))
+        self.col.addWidget(self.prompt)
+        dica = rotulo(tr("Pinte na imagem o que quer trocar ou apagar. O resto fica pixel a pixel igual."), "dica")
+        dica.setWordWrap(True)
+        self.col.addWidget(dica)
+
+    def _montar_avancados(self, lay):
+        self.maximo = self._slider_tamanho(tr("Tamanho de trabalho"),
+                                           tr("Automático: segue a imagem. O resultado volta ao tamanho original; só a área pintada muda."))
+        lay.addWidget(self.maximo)
+        self.forca = LinhaSlider(tr("Força"), 1, 4, 4, formato=lambda v: f"{v * 25}%",
+                                 dica=tr("100% refaz tudo; menos mantém parte do que estava."))
+        lay.addWidget(self.forca)
+
+    def _area_direita(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(8)
+        barra = QHBoxLayout()
+        barra.setSpacing(4)
+        self.vista = Segmentado([("pintar", tr("Pintar")), ("resultado", tr("Resultado"))], "pintar")
+        self.vista.setFixedWidth(220)
+        self.vista.mudou.connect(self._trocar_vista)
+        barra.addWidget(self.vista)
+        barra.addSpacing(10)
+        self.ferramentas = QWidget()
+        fh = QHBoxLayout(self.ferramentas)
+        fh.setContentsMargins(0, 0, 0, 0)
+        fh.setSpacing(4)
+        self.tela = TelaMascara()
+        self.tela.texto_vazio = tr("Cole a imagem (Ctrl+V) ou arraste aqui.\nDepois pinte o que quer refazer.")
+        fh.addWidget(botao_icone("colar", tr("Colar imagem (Ctrl+V)"), self.janela.colar_aqui))
+        fh.addWidget(botao_icone("abrir", tr("Abrir imagem…"), self._abrir))
+        fh.addSpacing(8)
+        self.bt_pincel = botao_icone("pincel", tr("Pincel (X alterna)"), lambda: self._ferramenta(False), True)
+        self.bt_borracha = botao_icone("borracha", tr("Borracha (X alterna)"), lambda: self._ferramenta(True), True)
+        self.bt_pincel.setChecked(True)
+        fh.addWidget(self.bt_pincel)
+        fh.addWidget(self.bt_borracha)
+        self.tam_pincel = LinhaSlider("", 2, 400, 30)
+        self.tam_pincel.setFixedWidth(150)
+        self.tam_pincel.setToolTip(tr("Tamanho do pincel ( [ e ] ou Alt+roda )"))
+        self.tam_pincel.mudou.connect(lambda v: self.tela.raio != v and self.tela.definir_raio(v))
+        self.tela.pincel_mudou.connect(lambda r: self.tam_pincel.definir(min(400, r)))
+        fh.addWidget(self.tam_pincel)
+        fh.addSpacing(8)
+        fh.addWidget(botao_icone("desfazer", tr("Desfazer (Ctrl+Z)"), self.tela.desfazer))
+        fh.addWidget(botao_icone("inverter", tr("Inverter máscara"), self.tela.inverter))
+        fh.addWidget(botao_icone("limpar", tr("Limpar máscara"), self.tela.limpar))
+        fh.addWidget(botao_icone("ajustar", tr("Ajustar à tela"), self.tela.ajustar))
+        barra.addWidget(self.ferramentas)
+        barra.addStretch()
+        v.addLayout(barra)
+        self.pilha = QStackedWidget()
+        self.pilha.addWidget(self.tela)
+        self.pilha.addWidget(self.resultado)
+        v.addWidget(self.pilha, 1)
+        self.tela.mudou.connect(self._sync_ferramenta)
+        return w
+
+    def _sync_ferramenta(self):
+        self.bt_pincel.setChecked(not self.tela.borracha)
+        self.bt_borracha.setChecked(self.tela.borracha)
+
+    def _ferramenta(self, borracha):
+        self.tela.borracha = borracha
+        self._sync_ferramenta()
+        self.tela.setFocus()
+
+    def _trocar_vista(self, v):
+        self.pilha.setCurrentIndex(0 if v == "pintar" else 1)
+        self.ferramentas.setVisible(v == "pintar")
+        (self.tela if v == "pintar" else self.resultado.visor).setFocus()
+
+    def _abrir(self):
+        p, _ = QFileDialog.getOpenFileName(self, tr("Abrir imagem"), "", FILTRO_IMAGENS)
+        if p:
+            self.colar([carregar_qimage(p)])
+
+    def colar(self, imgs):
+        if not imgs or imgs[0] is None or imgs[0].isNull():
+            return
+        img = imgs[0].convertToFormat(QImage.Format_RGB32)
+        self.tela.definir_imagem(img)
+        self.resultado.limpar()
+        self.resultado.mostrar_entrada(img)
+        self.vista.definir("pintar", True)
+
+    def continuar(self, img):
+        self.colar([img])
+        self.janela.toast(tr("Resultado virou a nova imagem base — pinte a próxima área"), "ok")
+
+    def montar_tarefa(self):
+        if not self.tela.tem_imagem():
+            raise ErroUsuario(tr("Cole ou abra uma imagem primeiro."))
+        if not self.tela.tem_mascara():
+            raise ErroUsuario(tr("Pinte a área que quer refazer."))
+        return {"tipo": "mascara", "prompt": self.prompt.texto(), "imagem": qimage_para_pil(self.tela.imagem()),
+                "mascara": self.tela.mascara_pil(), "maximo": self._maximo(self.maximo), "forca": self.forca.valor() / 4}
+
+    def ao_comecar(self):
+        super().ao_comecar()
+        self.vista.definir("resultado", True)
+
+    def copiar(self):
+        if self.pilha.currentIndex() == 1:
+            self.resultado.copiar()
+        elif self.tela.tem_imagem():
+            copiar_imagem(self.tela.imagem())
+            self.janela.toast(tr("Imagem copiada — é só colar (Ctrl+V)"), "ok")
+
+    def prefs_salvar(self, s):
+        super().prefs_salvar(s)
+        s.setValue("mascara/maximo", self.maximo.valor())
+        s.setValue("mascara/forca", self.forca.valor())
+
+    def prefs_carregar(self, s):
+        super().prefs_carregar(s)
+        self.maximo.definir(int(s.value("mascara/maximo", 7)))
+        self.forca.definir(int(s.value("mascara/forca", 4)))
+
+
+# ================================================================ Galeria
+class _SinalMini(QObject):
+    pronto = Signal(str, QImage)
+
+
+class _CarregaMini(QRunnable):
+    def __init__(self, caminho, sinal):
+        super().__init__()
+        self.caminho, self.sinal = caminho, sinal
+
+    def run(self):
+        r = QImageReader(self.caminho)
+        r.setAutoTransform(True)
+        s = r.size()
+        if s.isValid():
+            s.scale(QSize(360, 360), Qt.KeepAspectRatio)
+            r.setScaledSize(s)
+        img = r.read()
+        if not img.isNull():
+            self.sinal.pronto.emit(self.caminho, img)
+
+
+class PaginaGaleria(QWidget):
+    def __init__(self, janela):
+        super().__init__()
+        self.janela = janela
+        self._cache = {}
+        self._pool = QThreadPool(self)
+        self._pool.setMaxThreadCount(4)
+        self._sinal = _SinalMini()
+        self._sinal.pronto.connect(self._mini_pronta)
+        h = QHBoxLayout(self)
+        h.setContentsMargins(18, 18, 18, 18)
+        h.setSpacing(16)
+
+        esq = QVBoxLayout()
+        esq.setSpacing(12)
+        topo = QHBoxLayout()
+        topo.addWidget(rotulo(tr("Galeria"), "titulo"))
+        topo.addSpacing(16)
+        self.filtro = Segmentado([("", tr("Todas")), ("gerar", tr("Gerar")), ("editar", tr("Editar")),
+                                  ("mascara", tr("Máscara"))], "")
+        self.filtro.setFixedWidth(330)
+        self.filtro.mudou.connect(lambda _: self._filtrar())
+        topo.addWidget(self.filtro)
+        topo.addStretch()
+        self.busca = QLineEdit()
+        self.busca.setPlaceholderText(tr("Buscar no nome…"))
+        self.busca.setFixedWidth(220)
+        self.busca.textChanged.connect(lambda _: self._filtrar())
+        topo.addWidget(self.busca)
+        topo.addWidget(botao_icone("abrir", tr("Abrir a pasta das imagens"), lambda: _abrir_pasta(config.SAIDAS)))
+        esq.addLayout(topo)
+        self.lista = QListWidget()
+        self.lista.setViewMode(QListWidget.IconMode)
+        self.lista.setIconSize(QSize(170, 170))
+        self.lista.setGridSize(QSize(184, 184))
+        self.lista.setResizeMode(QListWidget.Adjust)
+        self.lista.setMovement(QListWidget.Static)
+        self.lista.setUniformItemSizes(True)
+        self.lista.setVerticalScrollMode(QListWidget.ScrollPerPixel)
+        self.lista.verticalScrollBar().setSingleStep(24)
+        self.lista.currentItemChanged.connect(self._selecionar)
+        self.lista.itemDoubleClicked.connect(lambda it: self._enviar("editar"))
+        self.lista.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.lista.customContextMenuRequested.connect(self._menu)
+        esq.addWidget(self.lista, 1)
+        h.addLayout(esq, 1)
+
+        cartao = _cartao()
+        cartao.setFixedWidth(440)
+        dv = QVBoxLayout(cartao)
+        dv.setContentsMargins(14, 14, 14, 14)
+        dv.setSpacing(10)
+        self.visor = Visor()
+        self.visor.texto_vazio = tr("Escolha uma imagem")
+        dv.addWidget(self.visor, 1)
+        self.meta = QLabel()
+        self.meta.setObjectName("info")
+        self.meta.setWordWrap(True)
+        self.meta.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        dv.addWidget(self.meta)
+        acoes = QHBoxLayout()
+        acoes.setSpacing(2)
+        acoes.addWidget(botao_icone("copiar", tr("Copiar imagem (Ctrl+C)"), self.copiar))
+        acoes.addWidget(botao_icone("historico", tr("Reusar o prompt"), self._reusar_prompt))
+        acoes.addWidget(botao_icone("editar", tr("Mandar para Editar"), lambda: self._enviar("editar")))
+        acoes.addWidget(botao_icone("mascara", tr("Mandar para Máscara"), lambda: self._enviar("mascara")))
+        acoes.addWidget(botao_icone("abrir", tr("Mostrar na pasta"), self._mostrar_na_pasta))
+        acoes.addStretch()
+        acoes.addWidget(botao_icone("lixo", tr("Mandar para a Lixeira"), self._apagar))
+        dv.addLayout(acoes)
+        h.addWidget(cartao)
+
+        self._vigia = QFileSystemWatcher([config.SAIDAS], self)
+        self._adiar = QTimer(self, singleShot=True, interval=500)
+        self._adiar.timeout.connect(self.recarregar)
+        self._vigia.directoryChanged.connect(lambda _: self._adiar.start())
+        self._carregado = False
+
+    def showEvent(self, e):
+        if not self._carregado:
+            self.recarregar()
+        super().showEvent(e)
+
+    def recarregar(self):
+        self._carregado = True
+        atual = self.lista.currentItem().data(Qt.UserRole) if self.lista.currentItem() else None
+        arqs = sorted((os.path.join(config.SAIDAS, a) for a in os.listdir(config.SAIDAS) if a.lower().endswith(EXT_IMAGEM)),
+                      key=os.path.getmtime, reverse=True)
+        self.lista.blockSignals(True)
+        self.lista.clear()
+        vazio = QPixmap(170, 170)
+        vazio.fill(Qt.transparent)
+        for p in arqs:
+            it = QListWidgetItem()
+            it.setData(Qt.UserRole, p)
+            it.setToolTip(os.path.basename(p))
+            it.setSizeHint(QSize(180, 180))
+            if p in self._cache:
+                it.setIcon(QIcon(self._cache[p]))
+            else:
+                it.setIcon(QIcon(vazio))
+                self._pool.start(_CarregaMini(p, self._sinal))
+            self.lista.addItem(it)
+            if p == atual:
+                self.lista.setCurrentItem(it)
+        self.lista.blockSignals(False)
+        self._filtrar()
+
+    def _mini_pronta(self, caminho, img):
+        pm = QPixmap.fromImage(img)
+        self._cache[caminho] = pm
+        for i in range(self.lista.count()):
+            it = self.lista.item(i)
+            if it.data(Qt.UserRole) == caminho:
+                it.setIcon(QIcon(pm))
+                break
+
+    def _filtrar(self):
+        modo, busca = self.filtro.valor(), self.busca.text().lower().strip()
+        for i in range(self.lista.count()):
+            it = self.lista.item(i)
+            nome = os.path.basename(it.data(Qt.UserRole)).lower()
+            ok = (not modo or f"_{modo}_" in nome) and (not busca or busca in nome)
+            it.setHidden(not ok)
+
+    def _caminho(self):
+        it = self.lista.currentItem()
+        return it.data(Qt.UserRole) if it else None
+
+    def _selecionar(self, it, _ant=None):
+        if not it:
+            self.visor.definir_imagem(None)
+            self.meta.setText("")
+            return
+        p = it.data(Qt.UserRole)
+        r = QImageReader(p)
+        r.setAutoTransform(True)
+        img = r.read()
+        self.visor.definir_imagem(img)
+        prompt = r.text("prompt")
+        partes = [f"<b>{os.path.basename(p)}</b>", f"{img.width()} × {img.height()}"]
+        for chave, rot in (("modelo", tr("Modelo")), ("semente", tr("Semente")), ("passos", tr("Passos"))):
+            if r.text(chave):
+                partes.append(f"{rot}: {r.text(chave)}")
+        texto = " · ".join(partes)
+        if prompt:
+            texto += f"<br><br>{prompt}"
+        self.meta.setText(texto)
+
+    def copiar(self):
+        img = self.visor.imagem()
+        if img is not None:
+            copiar_imagem(img)
+            self.janela.toast(tr("Imagem copiada — é só colar (Ctrl+V)"), "ok")
+
+    def _enviar(self, destino):
+        img = self.visor.imagem()
+        if img is not None:
+            self.janela.enviar_para(destino, [img])
+
+    def _reusar_prompt(self):
+        p = self._caminho()
+        if not p:
+            return
+        r = QImageReader(p)
+        prompt, modo = r.text("prompt"), r.text("modo") or "gerar"
+        if not prompt:
+            self.janela.toast(tr("Esta imagem não tem prompt salvo."), "aviso")
+            return
+        modo = modo if modo in ("gerar", "editar", "mascara") else "gerar"
+        self.janela.paginas[modo].prompt.definir("" if prompt == "limpar" else prompt)
+        self.janela.ir_para(modo)
+
+    def _mostrar_na_pasta(self):
+        p = self._caminho()
+        if p:
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(p)])
+
+    def _apagar(self):
+        from PySide6.QtCore import QFile
+        p = self._caminho()
+        if p and QFile.moveToTrash(p):
+            self._cache.pop(p, None)
+            self.janela.toast(tr("Enviada para a Lixeira"), "ok")
+            self.recarregar()
+
+    def _menu(self, pos):
+        it = self.lista.itemAt(pos)
+        if not it:
+            return
+        self.lista.setCurrentItem(it)
+        m = QMenu(self)
+        m.addAction(tr("Copiar imagem"), self.copiar)
+        m.addAction(tr("Reusar o prompt"), self._reusar_prompt)
+        m.addAction(tr("Mandar para Editar"), lambda: self._enviar("editar"))
+        m.addAction(tr("Mandar para Máscara"), lambda: self._enviar("mascara"))
+        m.addAction(tr("Mostrar na pasta"), self._mostrar_na_pasta)
+        m.addSeparator()
+        m.addAction(tr("Mandar para a Lixeira"), self._apagar)
+        m.exec(self.lista.mapToGlobal(pos))
+
+    def colar(self, imgs):
+        self.janela.enviar_para("editar", imgs)
+
+
+# ================================================================ Modelos
+class TrabalhoDownload(QObject):
+    progresso = Signal(float, float, float, str)
+    terminou = Signal(bool, str)
+
+    def __init__(self, modelo):
+        super().__init__()
+        self.b = Baixador(modelo, ao_progresso=lambda *a: self.progresso.emit(*a))
+
+    def rodar(self):
+        try:
+            self.b.baixar()
+            self.terminou.emit(True, "")
+        except Cancelado:
+            self.terminou.emit(False, "")
+        except Exception as e:  # noqa: BLE001
+            self.terminou.emit(False, str(e))
+
+
+class CartaoModelo(QFrame):
+    def __init__(self, pagina, m):
+        super().__init__()
+        self.pagina, self.m = pagina, m
+        self.setObjectName("cartao")
+        v = QVBoxLayout(self)
+        v.setContentsMargins(18, 16, 18, 16)
+        v.setSpacing(8)
+        topo = QHBoxLayout()
+        topo.setSpacing(8)
+        nome = QLabel(m["nome"])
+        nome.setStyleSheet("font-size: 15.5px; font-weight: 700;")
+        topo.addWidget(nome)
+        if m.get("principal"):
+            topo.addWidget(rotulo(tr("PRINCIPAL"), "etiquetaAcento"))
+        nomes = {"gerar": "Gerar", "editar": "Editar", "mascara": "Máscara"}
+        for t in [f"{m['vram']} GB VRAM", f"~{m['gb']:.0f} GB"] + [tr(nomes[x]) for x in m["modos"]] + [m["licenca"]]:
+            topo.addWidget(rotulo(t, "etiqueta"))
+        topo.addStretch()
+        self.estado = rotulo("", "valor")
+        topo.addWidget(self.estado)
+        v.addLayout(topo)
+        desc = rotulo(tr(m["descricao"]), "subtitulo")
+        desc.setWordWrap(True)
+        v.addWidget(desc)
+        self.caminho = rotulo("", "dica")
+        v.addWidget(self.caminho)
+        self.barra = QProgressBar()
+        self.barra.setObjectName("grossa")
+        self.barra.setRange(0, 1000)
+        self.barra.setVisible(False)
+        v.addWidget(self.barra)
+        self.detalhe = rotulo("", "info")
+        self.detalhe.setVisible(False)
+        v.addWidget(self.detalhe)
+        acoes = QHBoxLayout()
+        acoes.setSpacing(6)
+        self.bt_baixar = QPushButton(tr("Baixar"))
+        self.bt_baixar.setIcon(tema.icone("salvar", "white", 16))
+        self.bt_baixar.setCursor(Qt.PointingHandCursor)
+        self.bt_baixar.clicked.connect(lambda: self.pagina.janela.baixar(self.m))
+        self.bt_cancelar = QPushButton(tr("Pausar"))
+        self.bt_cancelar.clicked.connect(lambda: self.pagina.janela.cancelar_download(self.m["id"]))
+        self.bt_pasta = QPushButton(tr("Abrir pasta"))
+        self.bt_pasta.clicked.connect(lambda: _abrir_pasta(config.pasta_modelo(self.m["id"])))
+        self.bt_escolher = QPushButton(tr("Usar pasta existente…"))
+        self.bt_escolher.setToolTip(tr("Se você já tem este modelo baixado em outro lugar."))
+        self.bt_escolher.clicked.connect(self._escolher)
+        self.bt_apagar = QPushButton(tr("Apagar"))
+        self.bt_apagar.clicked.connect(self._apagar)
+        for b in (self.bt_baixar, self.bt_cancelar, self.bt_pasta, self.bt_escolher):
+            acoes.addWidget(b)
+        acoes.addStretch()
+        acoes.addWidget(self.bt_apagar)
+        v.addLayout(acoes)
+        self.atualizar()
+
+    def atualizar(self):
+        m = self.m
+        pasta = config.pasta_modelo(m["id"])
+        ok = config.modelo_instalado(m["id"], excluir=m.get("excluir", ()))
+        baixando = m["id"] in self.pagina.janela.downloads
+        parcial = os.path.isdir(pasta) and not ok
+        self.estado.setText(tr("Baixando…") if baixando else (tr("✓ Instalado") if ok else (tr("Incompleto") if parcial else tr("Não baixado"))))
+        self.estado.setStyleSheet(f"color: {tema.VERDE if ok else (tema.ACENTO2 if baixando else tema.SUAVE)};")
+        self.caminho.setText(pasta)
+        self.bt_baixar.setVisible(not ok and not baixando)
+        self.bt_baixar.setText(tr("Continuar download") if parcial else tr("Baixar ({gb} GB)", gb=f"{m['gb']:.0f}"))
+        self.bt_baixar.setObjectName("principal" if m.get("principal") else "")
+        self.bt_baixar.setStyleSheet("padding: 8px 16px; font-size: 13px;" if m.get("principal") else "")
+        self.bt_baixar.style().unpolish(self.bt_baixar)
+        self.bt_baixar.style().polish(self.bt_baixar)
+        self.bt_cancelar.setVisible(baixando)
+        self.bt_pasta.setVisible(os.path.isdir(pasta))
+        self.bt_escolher.setVisible(not baixando)
+        externo = os.path.normcase(os.path.abspath(pasta)) != os.path.normcase(os.path.join(config.PASTA_MODELOS, m["id"]))
+        self.bt_apagar.setText(tr("Esquecer pasta") if externo else tr("Apagar"))
+        self.bt_apagar.setVisible((ok or parcial or externo) and not baixando)
+        self.barra.setVisible(baixando)
+        self.detalhe.setVisible(baixando)
+
+    def progresso(self, feito, total, vel, arq):
+        self.barra.setValue(int(1000 * feito / total) if total else 0)
+        resta = (total - feito) / vel if vel > 1 else 0
+        eta = f" · {tr('faltam')} {int(resta // 60)} min {int(resta % 60)} s" if resta else ""
+        self.detalhe.setText(f"{_gb(feito)} / {_gb(total)} · {vel / 2**20:.1f} MB/s{eta}")
+
+    def _escolher(self):
+        p = QFileDialog.getExistingDirectory(self, tr("Pasta do modelo {nome}", nome=self.m["nome"]))
+        if not p:
+            return
+        if not config.modelo_instalado(pasta=p, excluir=self.m.get("excluir", ())):
+            QMessageBox.warning(self, tr("Pasta inválida"),
+                                tr("Essa pasta não tem o modelo completo no formato diffusers (model_index.json + subpastas)."))
+            return
+        config.definir_pasta(self.m["id"], p)
+        self.pagina.janela.modelos_mudaram()
+
+    def _apagar(self):
+        pasta = config.pasta_modelo(self.m["id"])
+        externo = os.path.normcase(os.path.abspath(pasta)) != os.path.normcase(os.path.join(config.PASTA_MODELOS, self.m["id"]))
+        if externo:
+            config.definir_pasta(self.m["id"], None)
+            self.pagina.janela.modelos_mudaram()
+            return
+        r = QMessageBox.question(self, tr("Apagar modelo"),
+                                 tr("Apagar {nome} do disco ({gb})? Dá para baixar de novo depois.",
+                                    nome=self.m["nome"], gb=_gb(config.tamanho_pasta(pasta))))
+        if r == QMessageBox.Yes:
+            self.pagina.janela.liberar_placa()
+            shutil.rmtree(pasta, ignore_errors=True)
+            self.pagina.janela.modelos_mudaram()
+
+
+class PaginaModelos(QWidget):
+    def __init__(self, janela):
+        super().__init__()
+        self.janela = janela
+        fora = QVBoxLayout(self)
+        fora.setContentsMargins(0, 0, 0, 0)
+        rolagem = QScrollArea()
+        rolagem.setWidgetResizable(True)
+        interno = QWidget()
+        v = QVBoxLayout(interno)
+        v.setContentsMargins(28, 22, 28, 28)
+        v.setSpacing(12)
+        v.addWidget(rotulo(tr("Modelos"), "titulo"))
+        sub = rotulo(tr("Ficam na pasta “modelos” ao lado do programa. O download continua de onde parou se cair."), "subtitulo")
+        sub.setWordWrap(True)
+        v.addWidget(sub)
+        self.cartoes = {}
+        grupos = [(tr("Principal"), [m for m in MODELOS if m.get("principal")]),
+                  (tr("Secundários · placas de 16 GB"), [m for m in MODELOS if not m.get("principal") and m["vram"] == 16]),
+                  (tr("Secundários · placas de 8 GB"), [m for m in MODELOS if not m.get("principal") and m["vram"] == 8])]
+        for titulo, lista in grupos:
+            if not lista:
+                continue
+            l = rotulo(titulo.upper(), "rotulo")
+            l.setContentsMargins(2, 12, 0, 0)
+            v.addWidget(l)
+            for m in lista:
+                c = CartaoModelo(self, m)
+                self.cartoes[m["id"]] = c
+                v.addWidget(c)
+        v.addStretch()
+        rolagem.setWidget(interno)
+        fora.addWidget(rolagem)
+
+    def atualizar(self):
+        for c in self.cartoes.values():
+            c.atualizar()
+
+    def colar(self, imgs):
+        self.janela.enviar_para("editar", imgs)
+
+
+# ================================================================ Configurações
+class PaginaConfig(QWidget):
+    _sinal_atualizacao = Signal(str, str)
+
+    def __init__(self, janela):
+        super().__init__()
+        self.janela = janela
+        self._sinal_atualizacao.connect(self._resposta_atualizacao)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(28, 22, 28, 28)
+        v.setSpacing(14)
+        v.addWidget(rotulo(tr("Configurações"), "titulo"))
+
+        c = _cartao()
+        cv = QVBoxLayout(c)
+        cv.setContentsMargins(18, 16, 18, 16)
+        cv.setSpacing(10)
+        cv.addWidget(rotulo(tr("Idioma"), "rotulo"))
+        h = QHBoxLayout()
+        self.idioma = QComboBox()
+        for cod, nome in i18n.IDIOMAS.items():
+            self.idioma.addItem(nome, cod)
+        self.idioma.setCurrentIndex(list(i18n.IDIOMAS).index(i18n.atual()))
+        self.idioma.setFixedWidth(260)
+        self.idioma.currentIndexChanged.connect(self._trocar_idioma)
+        h.addWidget(self.idioma)
+        self.bt_reiniciar = QPushButton(tr("Reiniciar para aplicar"))
+        self.bt_reiniciar.setObjectName("principal")
+        self.bt_reiniciar.setStyleSheet("padding: 8px 16px; font-size: 13px;")
+        self.bt_reiniciar.setVisible(False)
+        self.bt_reiniciar.clicked.connect(self.janela.reiniciar)
+        h.addWidget(self.bt_reiniciar)
+        h.addStretch()
+        cv.addLayout(h)
+        cv.addWidget(rotulo(tr("Na primeira vez o programa usa o idioma do Windows."), "dica"))
+        v.addWidget(c)
+
+        c = _cartao()
+        cv = QVBoxLayout(c)
+        cv.setContentsMargins(18, 16, 18, 16)
+        cv.setSpacing(8)
+        cv.addWidget(rotulo(tr("Placa de vídeo"), "rotulo"))
+        self.placa = rotulo(tr("Verificando…"), "valor")
+        self.placa.setStyleSheet("font-size: 14px;")
+        cv.addWidget(self.placa)
+        self.placa_dica = rotulo("", "dica")
+        self.placa_dica.setWordWrap(True)
+        cv.addWidget(self.placa_dica)
+        v.addWidget(c)
+
+        c = _cartao()
+        cv = QVBoxLayout(c)
+        cv.setContentsMargins(18, 16, 18, 16)
+        cv.setSpacing(8)
+        cv.addWidget(rotulo(tr("Atualizações"), "rotulo"))
+        h = QHBoxLayout()
+        h.addWidget(rotulo(tr("Versão {v}", v=instalacao.versao_local(config.BASE)), "valor"))
+        self.atualiza_txt = rotulo("", "dica")
+        h.addWidget(self.atualiza_txt, 1)
+        self.bt_atualizar = QPushButton(tr("Procurar atualização"))
+        self.bt_atualizar.clicked.connect(self._procurar_atualizacao)
+        h.addWidget(self.bt_atualizar)
+        cv.addLayout(h)
+        v.addWidget(c)
+
+        c = _cartao()
+        cv = QVBoxLayout(c)
+        cv.setContentsMargins(18, 16, 18, 16)
+        cv.setSpacing(8)
+        cv.addWidget(rotulo(tr("Pastas"), "rotulo"))
+        for texto, pasta in ((tr("Imagens geradas"), config.SAIDAS), (tr("Modelos"), config.PASTA_MODELOS),
+                             (tr("Programa"), config.BASE)):
+            h = QHBoxLayout()
+            h.addWidget(rotulo(texto, "valor"))
+            h.addWidget(rotulo(pasta, "dica"), 1)
+            b = QPushButton(tr("Abrir"))
+            b.clicked.connect(lambda _=False, p=pasta: _abrir_pasta(p))
+            h.addWidget(b)
+            cv.addLayout(h)
+        v.addWidget(c)
+
+        c = _cartao()
+        cv = QVBoxLayout(c)
+        cv.setContentsMargins(18, 16, 18, 16)
+        cv.setSpacing(6)
+        cv.addWidget(rotulo(tr("Atalhos"), "rotulo"))
+        for tecla, o_que in (("Ctrl+V", tr("Colar imagem (Photoshop, navegador, Explorer…) na aba atual")),
+                             ("Ctrl+C", tr("Copiar o resultado para colar em outro programa")),
+                             ("Ctrl+Enter", tr("Gerar / Editar / Refazer")), ("Esc", tr("Cancelar")),
+                             ("C", tr("Comparar antes/depois")), ("Ctrl+1…6", tr("Trocar de aba")),
+                             ("[  ]  ·  Alt+roda", tr("Tamanho do pincel (Máscara)")), ("X", tr("Pincel / borracha")),
+                             ("Ctrl+Z", tr("Desfazer pincelada")), (tr("Roda / duplo clique"), tr("Zoom / ajustar ↔ 100%"))):
+            h = QHBoxLayout()
+            k = rotulo(tecla, "etiqueta")
+            k.setFixedWidth(150)
+            h.addWidget(k)
+            h.addWidget(rotulo(o_que, "subtitulo"), 1)
+            cv.addLayout(h)
+        v.addWidget(c)
+        v.addStretch()
+
+    def definir_placa(self, nome, backend, total):
+        if nome:
+            self.placa.setText(f"{nome} · {backend} · {total:.0f} GB")
+            dica = tr("Tudo certo: o modelo roda na placa de vídeo.")
+            if total < 7.5:
+                dica = tr("Menos de 8 GB: use os modelos secundários de 8 GB ou tamanhos menores.")
+        else:
+            self.placa.setText(tr("Nenhuma placa compatível encontrada · rodando no processador"))
+            tipo = "AMD Radeon (ROCm)" if backend.endswith("ROCm") else "NVIDIA (CUDA)"
+            dica = tr("Vai funcionar, mas muito devagar. Esta versão precisa de placa {tipo}.", tipo=tipo)
+        self.placa_dica.setText(dica)
+
+    # ---- atualização pelo GitHub (roda numa thread do Python; avisa a tela por sinais)
+    def _procurar_atualizacao(self):
+        if os.path.isdir(os.path.join(config.BASE, ".git")):
+            self.atualiza_txt.setText(tr("Pasta de desenvolvimento (git): atualize com git pull."))
+            return
+        self.bt_atualizar.setEnabled(False)
+        self.atualiza_txt.setText(tr("Procurando…"))
+        import threading
+        threading.Thread(target=self._thread_atualizacao, daemon=True).start()
+
+    def _thread_atualizacao(self):
+        s = self._sinal_atualizacao
+        try:
+            remota, local = instalacao.versao_remota(), instalacao.versao_local(config.BASE)
+            if not instalacao.mais_nova(remota, local):
+                s.emit("ok", tr("Você já tem a versão mais nova."))
+                return
+            s.emit("pergunta", remota)
+        except Exception as e:  # noqa: BLE001
+            s.emit("erro", tr("Sem conexão com o GitHub: {e}", e=str(e)[:120]))
+
+    def _aplicar_atualizacao(self, remota):
+        import threading
+        self.atualiza_txt.setText(tr("Baixando a versão {v}…", v=remota))
+
+        def trabalho():
+            s = self._sinal_atualizacao
+            try:
+                mudou = instalacao.instalar_programa(config.BASE)
+                if mudou and os.path.isfile(instalacao.caminho_uv(config.BASE)):
+                    s.emit("info", tr("Atualizando as bibliotecas…"))
+                    cmd = instalacao.comandos_instalacao(config.BASE, "cuda")[2][1]  # só o requisitos.txt
+                    instalacao.rodar(cmd, config.BASE)
+                instalacao.gravar_info(config.BASE, versao=instalacao.versao_local(config.BASE))
+                s.emit("feito", remota)
+            except Exception as e:  # noqa: BLE001
+                s.emit("erro", tr("A atualização falhou: {e}", e=str(e)[:200]))
+        threading.Thread(target=trabalho, daemon=True).start()
+
+    def _resposta_atualizacao(self, tipo, texto):
+        if tipo == "pergunta":
+            r = QMessageBox.question(self, tr("Atualização"),
+                                     tr("Tem uma versão nova ({v}). Atualizar agora? Modelos, imagens e prompts ficam como estão.", v=texto))
+            if r == QMessageBox.Yes:
+                self._aplicar_atualizacao(texto)
+                return
+            texto = ""
+        elif tipo == "info":
+            self.atualiza_txt.setText(texto)
+            return
+        elif tipo == "feito":
+            self.atualiza_txt.setText(tr("Atualizado para a versão {v}.", v=texto))
+            self.bt_reiniciar.setVisible(True)
+            self.janela.toast(tr("Atualizado. Reinicie para usar a versão nova."), "ok", 5000)
+            return
+        self.atualiza_txt.setText(texto)
+        self.bt_atualizar.setEnabled(True)
+
+    def _trocar_idioma(self, i):
+        cod = self.idioma.itemData(i)
+        i18n.definir(cod)
+        self.bt_reiniciar.setVisible(cod != i18n.atual())
+
+    def colar(self, imgs):
+        self.janela.enviar_para("editar", imgs)

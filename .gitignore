@@ -1,0 +1,20 @@
+# ambientes e ferramentas (o instalador cria)
+.venv/
+.venv-*/
+ferramentas/
+__pycache__/
+*.pyc
+
+# do usuário: nunca vão para o GitHub
+modelos/
+saidas/
+config.json
+prompts.json
+preferencias.ini
+instalacao.json
+*.log
+autoteste.txt
+
+# compilação do instalador
+build/
+dist/
