@@ -169,7 +169,8 @@ class Baixador:
                     estado = set()
             else:
                 with open(parte, "wb") as f:
-                    f.truncate(tamanho)
+                    f.seek(tamanho - 1)  # truncate() no Windows grava zeros devagar
+                    f.write(b"\0")
             for ini in range(0, tamanho, PEDACO):
                 fim = min(ini + PEDACO, tamanho) - 1
                 if ini in estado:

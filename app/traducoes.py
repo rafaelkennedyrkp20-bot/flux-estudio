@@ -455,11 +455,10 @@ _T += [
     ("Cole a página (Ctrl+V) ou arraste aqui.\nDepois detecte o texto ou pinte o que quer apagar.",
      "Paste the page (Ctrl+V) or drag it here.\nThen detect the text or paint what you want to erase.",
      "Pega la página (Ctrl+V) o arrástrala aquí.\nLuego detecta el texto o pinta lo que quieres borrar."),
-    ("Pré-preencher com o LaMa de mangá (não inventa pessoas nem membros)", "Pre-fill with the manga LaMa (won't invent people or limbs)",
-     "Rellenar antes con el LaMa de manga (no inventa personas ni extremidades)"),
-    ("Antes do FLUX, o LaMa continua o fundo da área pintada. O FLUX só refina por cima.",
-     "Before FLUX, LaMa continues the background into the painted area. FLUX only refines on top.",
-     "Antes de FLUX, LaMa continúa el fondo en el área pintada. FLUX solo refina encima."),
+    ("Limpar antes com o LaMa (recomendado)", "Clean first with LaMa (recommended)", "Limpiar antes con LaMa (recomendado)"),
+    ("Antes do FLUX, o LaMa apaga o que foi pintado e continua o fundo. Assim o FLUX não desenha de volta nem inventa pessoas ou membros.",
+     "Before FLUX, LaMa erases what was painted and continues the background, so FLUX doesn't draw it back or invent people or limbs.",
+     "Antes de FLUX, LaMa borra lo pintado y continúa el fondo, así FLUX no lo vuelve a dibujar ni inventa personas o extremidades."),
     ("Apaga texto, balões e marca d'água e completa o fundo. Rápido e não inventa nada.",
      "Erases text, speech balloons and watermarks and fills in the background. Fast, and it doesn't invent anything.",
      "Borra texto, globos y marcas de agua y completa el fondo. Rápido y no inventa nada."),
@@ -497,6 +496,19 @@ _T += [
     ("Quanto o FLUX redesenha a área. 100% (padrão): redesenha a partir do fundo já limpo. Menos: mantém mais do que estava.",
      "How much FLUX redraws the area. 100% (default): redraws from the already-cleaned background. Less: keeps more of what was there.",
      "Cuánto redibuja FLUX el área. 100% (predeterminado): redibuja desde el fondo ya limpio. Menos: conserva más de lo que había."),
+]
+
+_T += [
+    # FLUX.2 klein 9B (opção de qualidade)
+    ("Licença do modelo", "Model license", "Licencia del modelo"),
+    ('O {nome} usa a licença <b>{lic}</b>: pode usar para fins pessoais e não comerciais.<br><br><a href="{url}">Ler a licença completa</a>',
+     '{nome} uses the <b>{lic}</b> license: you may use it for personal, non-commercial purposes.<br><br><a href="{url}">Read the full license</a>',
+     '{nome} usa la licencia <b>{lic}</b>: puedes usarlo para fines personales y no comerciales.<br><br><a href="{url}">Leer la licencia completa</a>'),
+    ("Li e aceito", "I have read and accept", "Leí y acepto"),
+    ("O {nome} precisa de uma placa de 16 GB.", "{nome} needs a 16 GB graphics card.", "{nome} necesita una tarjeta de 16 GB."),
+    ("Irmão maior do principal: anatomia e texto bem melhores, cerca de 2x mais lento (~11 s para gerar, ~23 s para editar numa 5060 Ti). Precisa de placa de 16 GB. Uso não comercial.",
+     "The main model's bigger sibling: much better anatomy and text, about 2x slower (~11 s to generate, ~23 s to edit on a 5060 Ti). Needs a 16 GB GPU. Non-commercial use.",
+     "Hermano mayor del principal: anatomía y texto mucho mejores, unas 2x más lento (~11 s para generar, ~23 s para editar en una 5060 Ti). Necesita tarjeta de 16 GB. Uso no comercial."),
 ]
 
 TRADUCOES = {"en": {pt: en for pt, en, _ in _T}, "es": {pt: es for pt, _, es in _T}}

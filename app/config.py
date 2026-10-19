@@ -57,6 +57,9 @@ def definir_pasta(id_modelo, pasta):
 def modelo_instalado(id_modelo=None, pasta=None, excluir=()):
     """Completo = model_index.json + a pasta de cada componente, e nenhum download pela metade."""
     pasta = pasta or pasta_modelo(id_modelo)
+    if id_modelo == "flux2-klein-9b":
+        from . import klein9b  # só biblioteca padrão no topo; o torch só entra no abrir()
+        return klein9b.instalado(pasta)
     indice = os.path.join(pasta, "model_index.json")
     if not os.path.isfile(indice):
         return False

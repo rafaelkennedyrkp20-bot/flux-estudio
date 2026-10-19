@@ -305,7 +305,7 @@ class JanelaPrincipal(QMainWindow):
         return "pronto" if getattr(self, "modelo_na_placa", "") == id_modelo else "fora"
 
     def carregar_modelo(self, m, modo="gerar"):
-        if self.modelo_carregando:
+        if self.modelo_carregando or not self.aceitar_licenca(m):
             return
         if not config.modelo_instalado(m["id"], excluir=m.get("excluir", ())):
             self.toast(tr("Baixe o modelo {nome} primeiro (aba Modelos).", nome=m["nome"]), "aviso", 4000)
@@ -409,8 +409,31 @@ class JanelaPrincipal(QMainWindow):
         self.lateral.vram_txt.setText(tr("VRAM {u:.1f} de {t:.1f} GB", u=usado / 2**30, t=total / 2**30))
 
     # ------------------------------------------------------------ downloads
+    def aceitar_licenca(self, m):
+        """Modelos com licença restrita (ex.: FLUX Non-Commercial do 9B): o usuário lê e aceita uma vez."""
+        if not m.get("exige_aceite"):
+            return True
+        aceites = config.carregar().get("licencas_aceitas", [])
+        if m["id"] in aceites:
+            return True
+        from PySide6.QtWidgets import QMessageBox
+        caixa = QMessageBox(self)
+        caixa.setWindowTitle(tr("Licença do modelo"))
+        caixa.setTextFormat(Qt.RichText)
+        caixa.setText(tr("O {nome} usa a licença <b>{lic}</b>: pode usar para fins pessoais e não comerciais.<br><br>"
+                         "<a href=\"{url}\">Ler a licença completa</a>", nome=m["nome"], lic=m["licenca"],
+                         url=m.get("licenca_url", "")))
+        caixa.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        aceito = caixa.addButton(tr("Li e aceito"), QMessageBox.AcceptRole)
+        caixa.addButton(tr("Cancelar"), QMessageBox.RejectRole)
+        caixa.exec()
+        if caixa.clickedButton() is not aceito:
+            return False
+        config.salvar({"licencas_aceitas": aceites + [m["id"]]})
+        return True
+
     def baixar(self, m):
-        if m["id"] in self.downloads:
+        if m["id"] in self.downloads or not self.aceitar_licenca(m):
             return
         th = QThread(self)
         tr_ = TrabalhoDownload(m)

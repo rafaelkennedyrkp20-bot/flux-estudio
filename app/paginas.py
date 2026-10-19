@@ -519,9 +519,9 @@ class PaginaMascara(PaginaTrabalho):
         self.prompt = CampoPrompt(self.janela.biblioteca, "mascara", tr("O que vai na área pintada"),
                                   tr("Vazio = limpar/remover o que foi pintado"))
         self.col.addWidget(self.prompt)
-        self.lama = QCheckBox(tr("Pré-preencher com o LaMa de mangá (não inventa pessoas nem membros)"))
+        self.lama = QCheckBox(tr("Limpar antes com o LaMa (recomendado)"))
         self.lama.setChecked(True)
-        self.lama.setToolTip(tr("Antes do FLUX, o LaMa continua o fundo da área pintada. O FLUX só refina por cima."))
+        self.lama.setToolTip(tr("Antes do FLUX, o LaMa apaga o que foi pintado e continua o fundo. Assim o FLUX não desenha de volta nem inventa pessoas ou membros."))
         self.col.addWidget(self.lama)
         self.forca = LinhaSlider(tr("Força"), 2, 20, 20, formato=lambda v: f"{v * 5}%",
                                  dica=tr("Quanto o FLUX redesenha a área. 100% (padrão): redesenha a partir do fundo já limpo. "
@@ -1109,16 +1109,25 @@ class TrabalhoDownload(QObject):
 
     def __init__(self, modelo):
         super().__init__()
+        self.m = modelo
         self.b = Baixador(modelo, ao_progresso=lambda *a: self.progresso.emit(*a))
+        self._parar = False
 
     def rodar(self):
         try:
-            self.b.baixar()
+            if self.m["id"] == "flux2-klein-9b":
+                from . import klein9b
+                self.b.cancelar = lambda: setattr(self, "_parar", True)
+                klein9b.baixar(config.pasta_modelo(self.m["id"]), lambda *a: self.progresso.emit(*a),
+                               lambda: self._parar, pasta_4b=config.pasta_modelo("flux2-klein-4b"))
+            else:
+                self.b.baixar()
             self.terminou.emit(True, "")
         except Cancelado:
             self.terminou.emit(False, "")
         except Exception as e:  # noqa: BLE001
-            self.terminou.emit(False, str(e))
+            # o klein9b tem a sua própria exceção Cancelado
+            self.terminou.emit(False, "" if type(e).__name__ == "Cancelado" else str(e))
 
 
 class CartaoModelo(QFrame):
@@ -1212,7 +1221,7 @@ class CartaoModelo(QFrame):
         p = QFileDialog.getExistingDirectory(self, tr("Pasta do modelo {nome}", nome=self.m["nome"]))
         if not p:
             return
-        if not config.modelo_instalado(pasta=p, excluir=self.m.get("excluir", ())):
+        if not config.modelo_instalado(self.m["id"], pasta=p, excluir=self.m.get("excluir", ())):
             QMessageBox.warning(self, tr("Pasta inválida"),
                                 tr("Essa pasta não tem o modelo completo no formato diffusers (model_index.json + subpastas)."))
             return

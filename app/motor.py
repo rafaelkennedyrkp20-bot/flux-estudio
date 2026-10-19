@@ -131,6 +131,21 @@ class Motor(QObject):
                 pipe.set_progress_bar_config(disable=True)
                 self._pipes[modo] = pipe
                 return m, pipe
+        elif m["tipo"] == "flux2_9b":
+            if not self._cabe_na_placa(15):
+                raise RuntimeError(tr("O {nome} precisa de uma placa de 16 GB.", nome=m["nome"]))
+            from . import klein9b
+            # GGUF Q8 do transformer na placa + Qwen3-8B int8 em memória fixada, transmitido por partes.
+            # klein9b.limitar_vram deixa 3 GB livres: sem isso o Windows joga o excesso na RAM e fica 10x mais lento.
+            base = klein9b.abrir(pasta, dtype)
+            base.set_progress_bar_config(disable=True)
+            self._rapido = True
+            self._pipes["gerar"] = self._pipes["editar"] = base
+            self._id = m["id"]
+            log.info("%s aberto em %.0f s", m["id"], time.time() - t0)
+            self._aquecer(base)
+            self.carregado.emit(m["id"])
+            return self._abrir(id_modelo, modo)
         elif m["tipo"] == "flux2" and self._cabe_na_placa():
             # Abre sempre o pipeline base (gerar/editar) e aquece nele; a máscara reaproveita os componentes.
             base = self._abrir_flux2_rapido(diffusers.Flux2KleinPipeline, pasta, dtype)
@@ -159,10 +174,10 @@ class Motor(QObject):
         return m, pipe
 
     @staticmethod
-    def _cabe_na_placa():
+    def _cabe_na_placa(gb=12):
         """12 GB+: transformer + VAE moram na placa (modo rápido). Menos que isso: um componente por vez."""
         import torch
-        return torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memory >= 12 * 2**30
+        return torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memory >= gb * 2**30
 
     def _abrir_flux2_rapido(self, classe, pasta, dtype):
         """Modo rápido do FLUX.2 klein. Antes, a cada imagem ~16 GB iam e voltavam da placa pelo PCIe
@@ -219,6 +234,7 @@ class Motor(QObject):
 
     def _liberar(self):
         had = bool(self._pipes)
+        era_9b = self._id == "flux2-klein-9b"
         self._pipes.clear()
         self._cache_prompt.clear()
         self._rapido = False
@@ -231,6 +247,10 @@ class Motor(QObject):
             import torch
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                if era_9b:
+                    from . import klein9b
+                    klein9b.liberar_ram_fixada()
+                    torch.cuda.set_per_process_memory_fraction(1.0)
         except ImportError:
             pass
         if had:
@@ -272,12 +292,12 @@ class Motor(QObject):
         n, passos, prompt = int(t["quantas"]), int(t["passos"]), t["prompt"]
         semente = t.get("semente", -1)
         s = int(semente) if semente is not None and int(semente) >= 0 else random.randint(0, 2**31 - 1)
-        if self._rapido and m["tipo"] == "flux2":
+        if self._rapido and m["tipo"].startswith("flux2"):
             kw["prompt_embeds"] = self._embeds(pipe, prompt)
         else:
             # Com offload por modelo, sempre pelo prompt: chamar encode_prompt por fora desmonta os ganchos.
             kw["prompt"] = prompt
-        kw["guidance_scale"] = 1.0 if m["tipo"] == "flux2" else float(t.get("guia", m["guia"]))
+        kw["guidance_scale"] = 1.0 if m["tipo"].startswith("flux2") else float(t.get("guia", m["guia"]))
         params = inspect.signature(pipe.__call__).parameters
         total = n * passos
         feitos = [0]
@@ -340,7 +360,7 @@ class Motor(QObject):
         refs = t["referencias"]  # lista de PIL RGB
         m, pipe = self._abrir(t["modelo"], "editar")
         t0 = time.time()
-        if m["tipo"] == "flux2":
+        if m["tipo"].startswith("flux2"):
             w, h = tamanho_trabalho(refs[0], m, t.get("maximo"))
             imgs, s = self._rodar(m, pipe, t, image=refs, width=w, height=h)
         else:  # InstructPix2Pix: uma referência, tamanho em múltiplos de 8

@@ -22,6 +22,15 @@ MODELOS = [
                   "4 passos, ~13 s por imagem 1024² numa 5060 Ti; pico de ~8 GB de VRAM.",
     ),
     dict(
+        id="flux2-klein-9b", nome="FLUX.2 [klein] 9B · qualidade", repo="unsloth/FLUX.2-klein-9B-GGUF",
+        tipo="flux2_9b", vram=16, lado_auto=1024, gb=24.7, licenca="FLUX Non-Commercial",
+        licenca_url="https://huggingface.co/black-forest-labs/FLUX.2-klein-9B/blob/main/LICENSE.md", exige_aceite=True,
+        modos=("gerar", "editar", "mascara"), passos=4, passos_max=12, guia=1.0, usa_guia=False, dtype="bfloat16",
+        classes={"gerar": "Flux2KleinPipeline", "editar": "Flux2KleinPipeline", "mascara": "Flux2KleinInpaintPipeline"},
+        descricao="Irmão maior do principal: anatomia e texto bem melhores, cerca de 2x mais lento (~11 s para gerar, "
+                  "~23 s para editar numa 5060 Ti). Precisa de placa de 16 GB. Uso não comercial.",
+    ),
+    dict(
         id="z-image-turbo", nome="Z-Image Turbo", repo="Tongyi-MAI/Z-Image-Turbo",
         tipo="generico", vram=16, lado_auto=1408, gb=30.6, licenca="Apache 2.0",
         modos=("gerar", "mascara"), passos=8, passos_max=16, guia=0.0, usa_guia=False, dtype="bfloat16",
