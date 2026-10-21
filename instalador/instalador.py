@@ -50,6 +50,7 @@ class Ponte(QObject):
     barra = Signal(int, int)            # feito, total (total 0 = indeterminado)
     linha = Signal(str)                 # log
     fim = Signal(bool, str)             # sucesso, mensagem
+    mostrar_pular = Signal(bool)        # botão "Pular teste"
 
 
 class Instalador(QWidget):
@@ -68,6 +69,7 @@ class Instalador(QWidget):
         self.ponte.barra.connect(self._ao_barra)
         self.ponte.linha.connect(lambda s: self.log.appendPlainText(s))
         self.ponte.fim.connect(self._ao_fim)
+        self.ponte.mostrar_pular.connect(lambda v: self.bt_pular.setVisible(v))
 
         v = QVBoxLayout(self)
         v.setContentsMargins(28, 24, 28, 24)
@@ -312,6 +314,11 @@ class Instalador(QWidget):
         v.addStretch()
         h = QHBoxLayout()
         h.addStretch()
+        self.bt_pular = QPushButton(tr("Pular teste"))
+        self.bt_pular.setToolTip(tr("O programa já está instalado; o teste só confere a placa de vídeo."))
+        self.bt_pular.clicked.connect(lambda: setattr(self, "_pular_teste", True))
+        self.bt_pular.setVisible(False)
+        h.addWidget(self.bt_pular)
         self.bt_cancelar = QPushButton(tr("Cancelar"))
         self.bt_cancelar.clicked.connect(self._pedir_cancelar)
         h.addWidget(self.bt_cancelar)
@@ -442,6 +449,9 @@ class Instalador(QWidget):
                     if resultado_teste is None:
                         p.passo.emit(i, "pulado")
                         continue
+                    if not resultado_teste.startswith("OK"):
+                        p.passo.emit(i, "erro")  # a instalação terminou; só o teste da placa não passou
+                        continue
                 p.passo.emit(i, "ok")
             p.fim.emit(True, resultado_teste or "")
         except InterruptedError:
@@ -492,26 +502,47 @@ class Instalador(QWidget):
                 json.dump({"idioma": i18n.atual()}, f)
         inst.limpar_cache(pasta)
 
+    LIMITE_TESTE_S = 15 * 60  # placas AMD compilam kernels na 1ª vez; depois disso é travamento
+
     def _testar(self, pasta, cancelado):
-        """Roda o autoteste do programa (abre o modelo e gera uma imagem pequena) se o modelo estiver lá."""
+        """Roda o autoteste do programa (abre o modelo e gera uma imagem pequena) se o modelo estiver lá.
+        Nunca segura a instalação: tem limite de tempo e o botão Pular teste; o resultado (ou até onde
+        chegou) vem do autoteste.txt, que o teste grava a cada etapa."""
         py = inst.python_do_venv(pasta)
         tem_modelo = os.path.isfile(os.path.join(pasta, "modelos", "flux2-klein-4b", "model_index.json")) or \
             self.pasta_modelo_existente
         if not tem_modelo:
             return None
         self.ponte.texto.emit(tr("Abrindo o modelo e gerando uma imagem de teste (1–2 min)…"))
+        self._pular_teste = False
+        self.ponte.mostrar_pular.emit(True)
+        aviso = ""
         try:
-            inst.rodar([py, "FluxEstudio.py", "--autoteste"], pasta, self.ponte.linha.emit, cancelado)
+            inst.rodar([py, "FluxEstudio.py", "--autoteste"], pasta,
+                       lambda l: (self.ponte.linha.emit(l), self.ponte.texto.emit(l[:140])),
+                       lambda: cancelado() or self._pular_teste, limite_s=self.LIMITE_TESTE_S)
+        except inst.TempoEsgotado:
+            aviso = tr("O teste passou de 15 minutos e foi interrompido.")
+        except InterruptedError:
+            if not self._pular_teste:
+                raise
+            aviso = tr("Teste pulado.")
         except RuntimeError:
             pass
+        finally:
+            self.ponte.mostrar_pular.emit(False)
         try:
             with open(os.path.join(pasta, "autoteste.txt"), encoding="utf-8") as f:
-                return f.read().strip()
+                texto = f.read().strip()
         except OSError:
-            return "FALHOU"
+            texto = "FALHOU"
+        if aviso:
+            texto = "FALHOU\n" + aviso + "\n" + texto.split("\n", 1)[-1]
+        return texto
 
     def _ao_fim(self, ok, msg):
         self.bt_cancelar.setVisible(False)
+        self.bt_pular.setVisible(False)
         self.idioma.setEnabled(True)
         self.barra.setRange(0, 1000)
         self.barra.setValue(1000 if ok else 0)
@@ -520,7 +551,11 @@ class Instalador(QWidget):
             if msg.startswith("OK"):
                 self.det.setText(tr("Teste da placa: OK — tudo funcionando.") + "\n" + msg.split("\n", 1)[-1])
             elif msg:
-                self.det.setText(tr("O programa foi instalado, mas o teste da placa falhou. Detalhes:") + "\n" + msg)
+                arq = os.path.join(self.pasta_final, "autoteste.txt")
+                ultimas = "\n".join(msg.split("\n")[1:][-6:])
+                self.det.setText(tr("O programa foi instalado, mas o teste da placa não terminou. Você já pode abrir o "
+                                    "Flux Estúdio. Para diagnosticar, mande este arquivo: {arq}", arq=arq) + "\n\n" + ultimas)
+                self.det.setTextInteractionFlags(Qt.TextSelectableByMouse)
                 self.bt_log.setChecked(True)
             else:
                 self.det.setText(tr("Instalado. Baixe o modelo na aba Modelos do programa."))

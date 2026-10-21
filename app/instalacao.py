@@ -235,28 +235,55 @@ def comandos_instalacao(pasta, backend, gfx=None):
     ]
 
 
-def rodar(cmd, pasta, ao_linha=None, cancelado=None):
-    """Roda um comando sem abrir janela, repassando cada linha da saída. Levanta erro se falhar."""
+class TempoEsgotado(RuntimeError):
+    pass
+
+
+def rodar(cmd, pasta, ao_linha=None, cancelado=None, limite_s=None):
+    """Roda um comando sem abrir janela, repassando cada linha da saída. Levanta erro se falhar.
+    A saída é lida numa thread: cancelar e o limite de tempo funcionam mesmo se o processo travar calado."""
+    import queue
+    import threading
+    import time
     proc = subprocess.Popen(cmd, cwd=pasta, env=ambiente_uv(pasta), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    ultimas = []
-    buf = b""
+    fila = queue.Queue()
+
+    def ler():
+        buf = b""
+        while True:
+            ch = proc.stdout.read(1)
+            if not ch:
+                break
+            if ch in (b"\n", b"\r"):
+                if buf.strip():
+                    fila.put(buf.decode("utf-8", "replace").strip())
+                buf = b""
+            else:
+                buf += ch
+        if buf.strip():
+            fila.put(buf.decode("utf-8", "replace").strip())
+        fila.put(None)
+
+    threading.Thread(target=ler, daemon=True).start()
+    ultimas, t0 = [], time.time()
     while True:
-        ch = proc.stdout.read(1)
-        if not ch:
+        try:
+            linha = fila.get(timeout=0.5)
+        except queue.Empty:
+            linha = ""
+        if linha is None:
             break
-        if ch in (b"\n", b"\r"):
-            linha = buf.decode("utf-8", "replace").strip()
-            buf = b""
-            if linha:
-                ultimas = (ultimas + [linha])[-15:]
-                if ao_linha:
-                    ao_linha(linha)
-            if cancelado and cancelado():
-                proc.kill()
-                raise InterruptedError
-        else:
-            buf += ch
+        if linha:
+            ultimas = (ultimas + [linha])[-15:]
+            if ao_linha:
+                ao_linha(linha)
+        if cancelado and cancelado():
+            proc.kill()
+            raise InterruptedError
+        if limite_s and time.time() - t0 > limite_s:
+            proc.kill()
+            raise TempoEsgotado("\n".join(ultimas[-8:]))
     if proc.wait() != 0:
         raise RuntimeError("\n".join(ultimas[-8:]) or f"falhou: {cmd[0]}")
 

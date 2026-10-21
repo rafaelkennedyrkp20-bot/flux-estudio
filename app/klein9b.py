@@ -585,7 +585,8 @@ def abrir(pasta, dtype=None, te_int8=True, reserva_vram_gb=3.0):
     torch.cuda.empty_cache()
     pipe = diffusers.Flux2KleinPipeline.from_pretrained(
         pasta, text_encoder=te, transformer=transformer, vae=vae, torch_dtype=dtype, local_files_only=True)
-    apply_group_offloading(te, onload_device=cuda, offload_type="leaf_level", use_stream=True)
+    apply_group_offloading(te, onload_device=cuda, offload_type="leaf_level",
+                           use_stream=not getattr(torch.version, "hip", None))  # síncrono no ROCm
     pipe.set_progress_bar_config(disable=True)
     return pipe
 

@@ -202,7 +202,9 @@ class Motor(QObject):
             os.path.join(pasta, "transformer"), torch_dtype=dtype, device_map="cuda")
         vae = diffusers.AutoencoderKLFlux2.from_pretrained(os.path.join(pasta, "vae"), torch_dtype=dtype, device_map="cuda")
         pipe = classe.from_pretrained(pasta, text_encoder=te, transformer=transformer, vae=vae, torch_dtype=dtype)
-        apply_group_offloading(te, onload_device=torch.device("cuda"), offload_type="leaf_level", use_stream=True)
+        # Streams paralelos só na NVIDIA: no ROCm do Windows ficam síncronos (nunca testados numa Radeon).
+        apply_group_offloading(te, onload_device=torch.device("cuda"), offload_type="leaf_level",
+                               use_stream=not getattr(torch.version, "hip", None))
         pipe.set_progress_bar_config(disable=True)
         self._rapido = True
         return pipe

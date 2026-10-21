@@ -10,42 +10,70 @@ import sys
 import traceback
 
 
+def ajustes_amd():
+    """Placas AMD (PyTorch ROCm). Precisa vir antes de importar o torch; nas NVIDIA não muda nada.
+    - MIOPEN_FIND_MODE=FAST: sem isso a MIOpen faz uma busca exaustiva de kernels na 1ª convolução
+      (VAE), que pode levar muitos minutos e parece travamento;
+    - TORCH_BLAS_PREFER_HIPBLASLT=0: contorno da própria AMD para travamentos da RX 9070."""
+    os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
+    os.environ.setdefault("TORCH_BLAS_PREFER_HIPBLASLT", "0")
+
+
 def autoteste():
-    """FluxEstudio.exe --autoteste: sem janela, verifica a placa e gera uma imagem pequena.
-    Escreve o resultado em autoteste.txt ao lado do programa (bom para diagnosticar outro PC)."""
+    """FluxEstudio.py --autoteste: sem janela, verifica a placa e gera uma imagem pequena.
+    Cada etapa vai para a saída e para autoteste.txt na hora: se travar, dá para ver onde."""
     import time
     from PySide6.QtCore import QCoreApplication
     from app import config
     app = QCoreApplication(sys.argv)  # noqa: F841 - os sinais Qt precisam de uma aplicação
+    arq = os.path.join(config.BASE, "autoteste.txt")
     linhas = []
-    log = lambda s: (linhas.append(s), print(s, flush=True))
+    t_ini = time.time()
+
+    def log(s, estado="RODANDO"):
+        linhas.append(f"[{time.time() - t_ini:5.0f}s] {s}")
+        print(linhas[-1], flush=True)
+        with open(arq, "w", encoding="utf-8") as f:
+            f.write(estado + "\n" + "\n".join(linhas) + "\n")
+
     ok = False
     try:
+        log("importando o PyTorch…")
+        import torch
+        log(f"PyTorch {torch.__version__} · {'ROCm ' + torch.version.hip if getattr(torch.version, 'hip', None) else 'CUDA ' + str(torch.version.cuda)}")
+        if not torch.cuda.is_available():
+            log("o PyTorch NÃO encontrou a placa de vídeo (ficaria no processador): teste interrompido. "
+                "Atualize o driver da placa (AMD Adrenalin / NVIDIA) e reinicie o PC.", "FALHOU")
+            sys.exit(1)
+        p = torch.cuda.get_device_properties(0)
+        log(f"placa: {p.name} · {p.total_memory / 2**30:.1f} GB")
+        x = torch.randn(1024, 1024, device="cuda")
+        torch.cuda.synchronize()
+        log(f"conta simples na placa OK ({float((x @ x).sum()):.0f})")
         from app.modelos import PRINCIPAL
         from app.motor import Motor
+        if not config.modelo_instalado(PRINCIPAL["id"]):
+            log(f"modelo principal não encontrado em {config.pasta_modelo(PRINCIPAL['id'])}", "FALHOU")
+            sys.exit(1)
         m = Motor()
         res = {}
-        m.placa.connect(lambda n, b, t: res.update(placa=(n, b, t)))
+        m.estado.connect(lambda e: log(e))
+        m.passo.connect(lambda a, b: log(f"passo {a}/{b}"))
         m.concluido.connect(lambda d: res.update(fim=d))
         m.falhou.connect(lambda e: res.update(erro=e))
         t0 = time.time()
-        m.executar({"tipo": "info"})
-        log(f"placa: {res.get('placa')}  (torch/diffusers em {time.time() - t0:.1f} s)")
-        if not config.modelo_instalado(PRINCIPAL["id"]):
-            log(f"modelo principal não encontrado em {config.pasta_modelo(PRINCIPAL['id'])}")
+        m.executar({"tipo": "gerar", "modelo": PRINCIPAL["id"], "prompt": "a red apple on a wooden table, photo",
+                    "largura": 512, "altura": 512, "passos": 4, "quantas": 1, "semente": 1, "guia": 1.0})
+        if "erro" in res:
+            log(f"ERRO ao gerar: {res['erro']}")
         else:
-            t0 = time.time()
-            m.executar({"tipo": "gerar", "modelo": PRINCIPAL["id"], "prompt": "a red apple on a wooden table, photo",
-                        "largura": 512, "altura": 512, "passos": 4, "quantas": 1, "semente": 1, "guia": 1.0})
-            if "erro" in res:
-                log(f"ERRO ao gerar: {res['erro']}")
-            else:
-                log(f"gerou em {time.time() - t0:.1f} s (inclui abrir o modelo): {res['fim']['caminhos']}")
-                ok = True
+            log(f"gerou em {time.time() - t0:.1f} s (inclui abrir o modelo): {res['fim']['caminhos']}")
+            ok = True
+    except SystemExit:
+        raise
     except Exception:  # noqa: BLE001
         log(traceback.format_exc())
-    with open(os.path.join(config.BASE, "autoteste.txt"), "w", encoding="utf-8") as f:
-        f.write(("OK" if ok else "FALHOU") + "\n" + "\n".join(linhas) + "\n")
+    log("pronto", "OK" if ok else "FALHOU")
     sys.exit(0 if ok else 1)
 
 
@@ -55,6 +83,7 @@ def main():
     for nome in ("stdout", "stderr"):
         if getattr(sys, nome) is None:
             setattr(sys, nome, open(os.devnull, "w", encoding="utf-8"))
+    ajustes_amd()
     if "--autoteste" in sys.argv:
         return autoteste()
     from app import config

@@ -511,4 +511,28 @@ _T += [
      "Hermano mayor del principal: anatomía y texto mucho mejores, unas 2x más lento (~11 s para generar, ~23 s para editar en una 5060 Ti). Necesita tarjeta de 16 GB. Uso no comercial."),
 ]
 
+_T += [
+    # instalador: teste da placa com limite de tempo
+    ("Pular teste", "Skip test", "Saltar prueba"),
+    ("O programa já está instalado; o teste só confere a placa de vídeo.",
+     "The program is already installed; the test only checks the graphics card.",
+     "El programa ya está instalado; la prueba solo revisa la tarjeta de video."),
+    ("O teste passou de 15 minutos e foi interrompido.", "The test ran over 15 minutes and was stopped.",
+     "La prueba pasó de 15 minutos y se detuvo."),
+    ("Teste pulado.", "Test skipped.", "Prueba saltada."),
+    ("O programa foi instalado, mas o teste da placa não terminou. Você já pode abrir o Flux Estúdio. Para diagnosticar, mande este arquivo: {arq}",
+     "The program was installed, but the graphics card test didn't finish. You can already open Flux Estúdio. To diagnose, send this file: {arq}",
+     "El programa se instaló, pero la prueba de la tarjeta no terminó. Ya puedes abrir Flux Estúdio. Para diagnosticar, envía este archivo: {arq}"),
+]
+
+_T += [
+    ("Testar a placa", "Test the graphics card", "Probar la tarjeta"),
+    ("Abre o modelo e gera uma imagem pequena, mostrando cada etapa. Salva autoteste.txt na pasta do programa.",
+     "Loads the model and generates a small image, showing every step. Saves autoteste.txt in the program folder.",
+     "Carga el modelo y genera una imagen pequeña, mostrando cada paso. Guarda autoteste.txt en la carpeta del programa."),
+    ("O teste falhou. Mande o arquivo {arq}", "The test failed. Send the file {arq}", "La prueba falló. Envía el archivo {arq}"),
+    ("Rodando o teste (a primeira vez pode levar alguns minutos)…", "Running the test (the first time can take a few minutes)…",
+     "Ejecutando la prueba (la primera vez puede tardar unos minutos)…"),
+]
+
 TRADUCOES = {"en": {pt: en for pt, en, _ in _T}, "es": {pt: es for pt, _, es in _T}}

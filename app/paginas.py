@@ -1348,6 +1348,10 @@ class PaginaConfig(QWidget):
         self.placa_dica.setWordWrap(True)
         cv.addWidget(self.placa_dica)
         cv.addWidget(self.pre_carregar)
+        bt_teste = QPushButton(tr("Testar a placa"))
+        bt_teste.setToolTip(tr("Abre o modelo e gera uma imagem pequena, mostrando cada etapa. Salva autoteste.txt na pasta do programa."))
+        bt_teste.clicked.connect(self._testar_placa)
+        cv.addWidget(bt_teste, 0, Qt.AlignLeft)
         v.addWidget(c)
 
         c = _cartao()
@@ -1419,6 +1423,41 @@ class PaginaConfig(QWidget):
             cv.addLayout(h)
         v.addWidget(c)
         v.addStretch()
+
+    def _testar_placa(self):
+        """Roda `FluxEstudio.py --autoteste` num processo à parte e mostra cada etapa ao vivo."""
+        if self.janela.ocupado:
+            self.janela.toast(tr("Espere terminar ou cancele (Esc) antes."), "aviso")
+            return
+        self.janela.liberar_placa()  # o teste precisa da placa livre
+        from PySide6.QtCore import QProcess
+        from PySide6.QtWidgets import QDialog, QPlainTextEdit
+        d = QDialog(self)
+        d.setWindowTitle(tr("Testar a placa"))
+        d.resize(760, 460)
+        d.setStyleSheet(f"QDialog {{ background: {tema.PAINEL}; }}")
+        v = QVBoxLayout(d)
+        txt = QPlainTextEdit()
+        txt.setReadOnly(True)
+        txt.setStyleSheet("font-family: Consolas; font-size: 12px;")
+        v.addWidget(txt)
+        fechar = QPushButton(tr("Fechar"))
+        v.addWidget(fechar, 0, Qt.AlignRight)
+        py = sys.executable.replace("pythonw.exe", "python.exe")
+        proc = QProcess(d)
+        proc.setWorkingDirectory(config.BASE)
+        proc.setProcessChannelMode(QProcess.MergedChannels)
+        proc.readyReadStandardOutput.connect(
+            lambda: txt.appendPlainText(bytes(proc.readAllStandardOutput()).decode("utf-8", "replace").rstrip()))
+        proc.finished.connect(lambda code, _s: txt.appendPlainText(
+            "\n" + (tr("Tudo certo: o modelo roda na placa de vídeo.") if code == 0 else
+                    tr("O teste falhou. Mande o arquivo {arq}", arq=os.path.join(config.BASE, "autoteste.txt")))))
+        fechar.clicked.connect(lambda: (proc.kill(), d.accept()))
+        txt.appendPlainText(tr("Rodando o teste (a primeira vez pode levar alguns minutos)…"))
+        QTimer.singleShot(800, lambda: proc.start(py, [os.path.join(config.BASE, "FluxEstudio.py"), "--autoteste"]))
+        tema.barra_titulo_escura(d)
+        d.exec()
+        proc.kill()
 
     def definir_placa(self, nome, backend, total):
         if nome:
