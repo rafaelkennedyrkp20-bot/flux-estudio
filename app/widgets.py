@@ -13,10 +13,31 @@ from PySide6.QtWidgets import (QApplication, QGraphicsOpacityEffect, QHBoxLayout
 from . import tema
 from .i18n import tr
 
-EXT_IMAGEM = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif")
+EXT_IMAGEM = (".png", ".jpg", ".jpeg", ".jfif", ".webp", ".bmp", ".tif", ".tiff", ".gif", ".avif")
+LADO_TEXTURA_MAX = 4096
+MAX_BYTES_DESFAZER = 256 * 2**20
 
 
 # ---------------------------------------------------------------- área de transferência
+def mime_tem_imagem(md):
+    """Checagem instantânea para dragEnterEvent/dragMoveEvent — sem decodificar pixels nem ler arquivos."""
+    if md is None:
+        return False
+    if md.hasUrls():
+        for u in md.urls():
+            p = u.toLocalFile()
+            if p and p.lower().endswith(EXT_IMAGEM):
+                return True
+    if md.hasImage():
+        return True
+    for fmt in md.formats():
+        f = fmt.lower()
+        if (f.startswith("image/") or 'value="png"' in f or "value=png" in f
+                or f in ("png", "dib", "application/x-qt-image")):
+            return True
+    return False
+
+
 def imagem_do_mime(md):
     """QImage de um QMimeData: PNG bruto (Photoshop, navegadores: mantém transparência),
     bitmap do Windows (DIB), ou arquivo de imagem copiado no Explorer. None se não houver."""
@@ -24,7 +45,7 @@ def imagem_do_mime(md):
         return None
     for fmt in md.formats():
         f = fmt.lower()
-        if f == "image/png" or f.endswith('value="png"') or f.endswith("value=png"):
+        if f == "image/png" or f.endswith('value="png"') or f.endswith("value=png") or f == "png":
             img = QImage.fromData(md.data(fmt), "PNG")
             if not img.isNull():
                 return img
@@ -45,8 +66,12 @@ def imagem_do_mime(md):
 def caminhos_do_mime(md):
     if md is None or not md.hasUrls():
         return []
-    return [u.toLocalFile() for u in md.urls()
-            if u.toLocalFile().lower().endswith(EXT_IMAGEM) and os.path.isfile(u.toLocalFile())]
+    out = []
+    for u in md.urls():
+        p = u.toLocalFile()
+        if p and p.lower().endswith(EXT_IMAGEM) and os.path.isfile(p):
+            out.append(p)
+    return out
 
 
 def imagens_do_mime(md):
@@ -59,9 +84,7 @@ def imagens_do_mime(md):
 
 
 def area_tem_imagem():
-    md = QGuiApplication.clipboard().mimeData()
-    return md is not None and (md.hasImage() or bool(caminhos_do_mime(md))
-                               or any(f.lower() == "image/png" or 'png' in f.lower() for f in md.formats()))
+    return mime_tem_imagem(QGuiApplication.clipboard().mimeData())
 
 
 def copiar_imagem(img):
@@ -80,7 +103,27 @@ def copiar_imagem(img):
 def carregar_qimage(caminho):
     r = QImageReader(caminho)
     r.setAutoTransform(True)
-    return r.read()
+    img = r.read()
+    if not img.isNull():
+        return img
+    # Fallback via Pillow (ex.: TIFF 16-bit, JPEG CMYK do Photoshop, WebP/AVIF especiais).
+    try:
+        with Image.open(caminho) as pil:
+            rgba = pil.convert("RGBA")
+            w, h = rgba.size
+            dados = rgba.tobytes("raw", "RGBA")
+            return QImage(dados, w, h, w * 4, QImage.Format_RGBA8888).copy()
+    except Exception:  # noqa: BLE001
+        return QImage()
+
+
+def _pixmap_exibicao(img):
+    """Cria QPixmap limitado a 4096 px no maior lado (evita textura em branco no Direct2D e travadas em tiras longas)."""
+    if img is None or img.isNull():
+        return None
+    if max(img.width(), img.height()) > LADO_TEXTURA_MAX:
+        img = img.scaled(LADO_TEXTURA_MAX, LADO_TEXTURA_MAX, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    return QPixmap.fromImage(img)
 
 
 def qimage_para_pil(img):
@@ -124,24 +167,31 @@ class VisorBase(QWidget):
         self.texto_vazio = ""
 
     def tem_imagem(self):
-        return self._pix is not None
+        return self._img is not None
 
     def imagem(self):
         return self._img
 
+    def _largura(self):
+        return self._img.width() if self._img is not None else 1
+
+    def _altura(self):
+        return self._img.height() if self._img is not None else 1
+
     def definir_imagem(self, img, manter_vista=False):
-        mesmo_tamanho = self._img is not None and img is not None and img.size() == self._img.size()
-        self._img = img
-        self._pix = QPixmap.fromImage(img) if img is not None and not img.isNull() else None
+        valida = img if (img is not None and not img.isNull()) else None
+        mesmo_tamanho = self._img is not None and valida is not None and valida.size() == self._img.size()
+        self._img = valida
+        self._pix = _pixmap_exibicao(valida)
         if not (manter_vista and mesmo_tamanho):
             self.ajustar()
         self.update()
 
     def ajustar(self):
         self._auto = True
-        if self._pix is None:
+        if self._img is None:
             return
-        pw, ph = self._pix.width(), self._pix.height()
+        pw, ph = self._largura(), self._altura()
         m = 24
         s = min((self.width() - 2 * m) / pw, (self.height() - 2 * m) / ph)
         self._escala = max(0.01, s)
@@ -176,7 +226,7 @@ class VisorBase(QWidget):
         self.vista_mudou.emit()
 
     def wheelEvent(self, e):
-        if self._pix is None:
+        if self._img is None:
             return
         passos = e.angleDelta().y() / 120
         base = self._para if self._anim.state() == QVariantAnimation.Running else self._escala
@@ -206,7 +256,7 @@ class VisorBase(QWidget):
         self.unsetCursor()
 
     def mouseDoubleClickEvent(self, e):
-        if self._pix is None:
+        if self._img is None:
             return
         if self._auto:
             self.tamanho_real(e.position())
@@ -214,7 +264,7 @@ class VisorBase(QWidget):
             self.ajustar()
 
     def _retangulo_imagem(self):
-        return QRectF(self._desl.x(), self._desl.y(), self._pix.width() * self._escala, self._pix.height() * self._escala)
+        return QRectF(self._desl.x(), self._desl.y(), self._largura() * self._escala, self._altura() * self._escala)
 
     def _pintar_fundo(self, p):
         p.fillRect(self.rect(), QColor(tema.FUNDO))
@@ -235,12 +285,32 @@ class VisorBase(QWidget):
         p.setPen(QColor(tema.SUAVE))
         p.drawText(r, Qt.AlignCenter | Qt.TextWordWrap, self.texto_vazio)
 
-    def _desenhar_pix(self, p, pix, alvo, recorte=None):
+    def _desenhar_pix(self, p, pix, alvo, recorte=None, img_orig=None):
         p.setRenderHint(QPainter.SmoothPixmapTransform, self._escala < 2.5)
         if recorte is not None:
             p.save()
             p.setClipRect(recorte)
-        p.drawPixmap(alvo, pix, QRectF(pix.rect()))
+        # Se a imagem original foi reduzida em `_pix` (ex.: tira longa de webtoon) e o usuário deu zoom,
+        # desenha apenas a fatia visível direto da QImage original em resolução total.
+        if (img_orig is not None and pix is not None
+                and (img_orig.width() > pix.width() or img_orig.height() > pix.height())
+                and self._escala > (pix.width() / max(1, img_orig.width())) * 1.15):
+            vis = QRectF(self.rect()).intersected(alvo if recorte is None else alvo.intersected(recorte))
+            if not vis.isEmpty():
+                iw, ih = img_orig.width(), img_orig.height()
+                ex = max(1e-6, alvo.width() / max(1, iw))
+                ey = max(1e-6, alvo.height() / max(1, ih))
+                sx0 = max(0, int((vis.left() - alvo.left()) / ex) - 2)
+                sy0 = max(0, int((vis.top() - alvo.top()) / ey) - 2)
+                sx1 = min(iw, int((vis.right() - alvo.left()) / ex) + 3)
+                sy1 = min(ih, int((vis.bottom() - alvo.top()) / ey) + 3)
+                if sx1 > sx0 and sy1 > sy0:
+                    src = QRectF(sx0, sy0, sx1 - sx0, sy1 - sy0)
+                    dst = QRectF(alvo.left() + sx0 * ex, alvo.top() + sy0 * ey,
+                                 (sx1 - sx0) * ex, (sy1 - sy0) * ey)
+                    p.drawImage(dst, img_orig, src)
+        elif pix is not None:
+            p.drawPixmap(alvo, pix, QRectF(pix.rect()))
         if recorte is not None:
             p.restore()
 
@@ -290,12 +360,13 @@ class Visor(VisorBase):
             self._fade = 1.0
 
     def definir_antes(self, img):
-        self._antes = img
-        self._antes_pix = QPixmap.fromImage(img) if img is not None else None
+        self._antes = img if (img is not None and not img.isNull()) else None
+        self._antes_pix = _pixmap_exibicao(self._antes)
         self.update()
 
     def pode_comparar(self):
-        return self._antes_pix is not None and self._pix is not None and self._antes_pix.cacheKey() != self._pix.cacheKey()
+        return (self._antes is not None and self._img is not None
+                and self._antes.cacheKey() != self._img.cacheKey())
 
     def mousePressEvent(self, e):
         if e.button() in (Qt.LeftButton, Qt.MiddleButton, Qt.RightButton) and self._pix is not None:
@@ -336,12 +407,12 @@ class Visor(VisorBase):
                 p.setOpacity(1.0 - self._fade)
                 self._desenhar_pix(p, pv, rv)
                 p.setOpacity(self._fade)
-            self._desenhar_pix(p, self._pix, r)
+            self._desenhar_pix(p, self._pix, r, img_orig=self._img)
             p.setOpacity(1.0)
             if self.comparar and self.pode_comparar():
                 x = r.x() + r.width() * self._linha
                 corte = QRectF(r.x(), r.y(), x - r.x(), r.height())
-                self._desenhar_pix(p, self._antes_pix, r, corte)
+                self._desenhar_pix(p, self._antes_pix, r, corte, img_orig=self._antes)
                 p.setPen(QPen(QColor(255, 255, 255, 220), 2))
                 p.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()))
                 for texto, alinhar, cx in ((tr("ANTES"), Qt.AlignLeft, r.x() + 10), (tr("DEPOIS"), Qt.AlignRight, r.right() - 90)):
@@ -373,69 +444,122 @@ class TelaMascara(VisorBase):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._mascara = None
+        self._mascara = None       # QImage Format_Grayscale8 (1 byte/pixel, tamanho original)
+        self._mascara_pix = None   # QPixmap colorido p/ exibição rápida a 60 FPS (até 4096 px)
         self.borracha = False
         self.raio = 30
         self._ultimo = None
         self._desfazer = []
         self._mouse = None
-        self.setCursor(Qt.BlankCursor)
 
-    def definir_imagem(self, img, manter_vista=False):
-        super().definir_imagem(img, manter_vista)
-        if img is not None:
-            self._mascara = QImage(img.size(), QImage.Format_ARGB32_Premultiplied)
-            self._mascara.fill(Qt.transparent)
-            self.raio = max(8, int(max(img.width(), img.height()) / 45))
-            self.pincel_mudou.emit(self.raio)
+    def _atualizar_cursor(self):
+        if self._pan is not None:
+            self.setCursor(Qt.ClosedHandCursor)
+        elif self._img is not None:
+            self.setCursor(Qt.BlankCursor)
         else:
-            self._mascara = None
-        self._desfazer.clear()
-        self.mudou.emit()
+            self.unsetCursor()
 
-    def tem_mascara(self):
-        if self._mascara is None:
-            return False
-        a = self._mascara.convertToFormat(QImage.Format_Alpha8)
-        return any(bytes(a.constBits()))
-
-    def mascara_pil(self):
-        a = self._mascara.convertToFormat(QImage.Format_Alpha8)
-        return Image.frombuffer("L", (a.width(), a.height()), bytes(a.constBits()), "raw", "L", a.bytesPerLine(), 1).copy()
-
-    def _guardar(self):
-        self._desfazer.append(self._mascara.copy())
-        del self._desfazer[:-40]
-
-    def desfazer(self):
-        if self._desfazer:
-            self._mascara = self._desfazer.pop()
-            self.update()
-            self.mudou.emit()
-
-    def somar_mascara(self, pil_l):
-        """Junta uma máscara PIL (L, mesmo tamanho da imagem) à que já está pintada (ex.: texto detectado)."""
-        if self._mascara is None:
+    def _sincronizar_mascara_pix(self):
+        """Reconstrói o QPixmap colorido de exibição a partir da máscara 8-bit."""
+        if self._mascara is None or self._pix is None:
+            self._mascara_pix = None
             return
-        self._guardar()
-        a = pil_l.convert("L").resize((self._mascara.width(), self._mascara.height()))
-        alfa = QImage(a.tobytes(), a.width, a.height, a.width, QImage.Format_Alpha8).copy()
-        cor = QImage(self._mascara.size(), QImage.Format_ARGB32_Premultiplied)
+        esc = self._mascara if self._mascara.size() == self._pix.size() else self._mascara.scaled(
+            self._pix.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        alfa = QImage(esc.constBits(), esc.width(), esc.height(), esc.bytesPerLine(), QImage.Format_Alpha8)
+        cor = QImage(self._pix.size(), QImage.Format_ARGB32_Premultiplied)
         cor.fill(QColor(tema.ACENTO))
         p = QPainter(cor)
         p.setCompositionMode(QPainter.CompositionMode_DestinationIn)
         p.drawImage(0, 0, alfa)
         p.end()
-        p = QPainter(self._mascara)
-        p.drawImage(0, 0, cor)
-        p.end()
+        self._mascara_pix = QPixmap.fromImage(cor)
+
+    def definir_imagem(self, img, manter_vista=False):
+        super().definir_imagem(img, manter_vista)
+        if self._img is not None:
+            self._mascara = QImage(self._img.size(), QImage.Format_Grayscale8)
+            self._mascara.fill(0)
+            self._mascara_pix = QPixmap(self._pix.size())
+            self._mascara_pix.fill(Qt.transparent)
+            self.raio = max(8, int(max(self._img.width(), self._img.height()) / 45))
+            self.pincel_mudou.emit(self.raio)
+        else:
+            self._mascara = None
+            self._mascara_pix = None
+        self._desfazer.clear()
+        self._atualizar_cursor()
+        self.mudou.emit()
+
+    def tem_mascara(self):
+        if self._mascara is None:
+            return False
+        import numpy as np
+        arr = np.frombuffer(self._mascara.constBits(), dtype=np.uint8).reshape(
+            self._mascara.height(), self._mascara.bytesPerLine())[:, :self._mascara.width()]
+        return bool(arr.any())
+
+    def mascara_pil(self):
+        if self._mascara is None:
+            return None
+        return Image.frombuffer(
+            "L", (self._mascara.width(), self._mascara.height()),
+            bytes(self._mascara.constBits()), "raw", "L", self._mascara.bytesPerLine(), 1
+        ).copy()
+
+    def definir_mascara(self, pil_l):
+        """Substitui a máscara por uma PIL (L) — usado ao transferir imagem + máscara entre abas."""
+        if self._mascara is None or pil_l is None:
+            return
+        a = pil_l.convert("L")
+        if a.size != (self._mascara.width(), self._mascara.height()):
+            a = a.resize((self._mascara.width(), self._mascara.height()), Image.NEAREST)
+        self._mascara = QImage(a.tobytes(), a.width, a.height, a.width, QImage.Format_Grayscale8).copy()
+        self._sincronizar_mascara_pix()
+        self.update()
+        self.mudou.emit()
+
+    def _guardar(self):
+        if self._mascara is None:
+            return
+        self._desfazer.append(self._mascara.copy())
+        if len(self._desfazer) > 35:
+            del self._desfazer[:-35]
+        por_passo = max(1, self._mascara.sizeInBytes())
+        limite = max(4, MAX_BYTES_DESFAZER // por_passo)
+        if len(self._desfazer) > limite:
+            del self._desfazer[:-limite]
+
+    def desfazer(self):
+        if self._desfazer:
+            self._mascara = self._desfazer.pop()
+            self._sincronizar_mascara_pix()
+            self.update()
+            self.mudou.emit()
+
+    def somar_mascara(self, pil_l):
+        """Junta uma máscara PIL (L, mesmo tamanho da imagem) à que já está pintada (ex.: texto detectado)."""
+        if self._mascara is None or pil_l is None:
+            return
+        self._guardar()
+        import numpy as np
+        a = pil_l.convert("L")
+        if a.size != (self._mascara.width(), self._mascara.height()):
+            a = a.resize((self._mascara.width(), self._mascara.height()), Image.NEAREST)
+        atual = self.mascara_pil()
+        unida = Image.fromarray(np.maximum(np.asarray(atual), np.asarray(a)))
+        self._mascara = QImage(unida.tobytes(), unida.width, unida.height, unida.width, QImage.Format_Grayscale8).copy()
+        self._sincronizar_mascara_pix()
         self.update()
         self.mudou.emit()
 
     def limpar(self):
         if self._mascara is not None:
             self._guardar()
-            self._mascara.fill(Qt.transparent)
+            self._mascara.fill(0)
+            if self._mascara_pix is not None:
+                self._mascara_pix.fill(Qt.transparent)
             self.update()
             self.mudou.emit()
 
@@ -443,13 +567,8 @@ class TelaMascara(VisorBase):
         if self._mascara is None:
             return
         self._guardar()
-        nova = QImage(self._mascara.size(), QImage.Format_ARGB32_Premultiplied)
-        nova.fill(QColor(tema.ACENTO))
-        p = QPainter(nova)
-        p.setCompositionMode(QPainter.CompositionMode_DestinationOut)
-        p.drawImage(0, 0, self._mascara)
-        p.end()
-        self._mascara = nova
+        self._mascara.invertPixels()
+        self._sincronizar_mascara_pix()
         self.update()
         self.mudou.emit()
 
@@ -459,23 +578,41 @@ class TelaMascara(VisorBase):
         self.update()
 
     def _pintar(self, a, b):
+        cor_m = QColor(0, 0, 0) if self.borracha else QColor(255, 255, 255)
         p = QPainter(self._mascara)
         p.setRenderHint(QPainter.Antialiasing)
-        if self.borracha:
-            p.setCompositionMode(QPainter.CompositionMode_Clear)
-        pen = QPen(QColor(tema.ACENTO), self.raio * 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-        p.setPen(pen)
         if a == b:
             p.setPen(Qt.NoPen)
-            p.setBrush(QColor(tema.ACENTO))
+            p.setBrush(cor_m)
             p.drawEllipse(a, self.raio, self.raio)
         else:
+            p.setPen(QPen(cor_m, self.raio * 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
             p.drawLine(a, b)
         p.end()
+
+        if self._mascara_pix is not None and self._mascara.width() > 0 and self._mascara.height() > 0:
+            fx = self._mascara_pix.width() / self._mascara.width()
+            fy = self._mascara_pix.height() / self._mascara.height()
+            pa = QPointF(a.x() * fx, a.y() * fy)
+            pb = QPointF(b.x() * fx, b.y() * fy)
+            rm = max(0.75, self.raio * (fx + fy) * 0.5)
+            pm = QPainter(self._mascara_pix)
+            pm.setRenderHint(QPainter.Antialiasing)
+            if self.borracha:
+                pm.setCompositionMode(QPainter.CompositionMode_Clear)
+            cor_v = QColor(tema.ACENTO)
+            if a == b:
+                pm.setPen(Qt.NoPen)
+                pm.setBrush(cor_v)
+                pm.drawEllipse(pa, rm, rm)
+            else:
+                pm.setPen(QPen(cor_v, rm * 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                pm.drawLine(pa, pb)
+            pm.end()
         self.update()
 
     def mousePressEvent(self, e):
-        if self._pix is None:
+        if self._img is None:
             return
         if e.button() == Qt.LeftButton and not (e.modifiers() & Qt.ControlModifier):
             self._guardar()
@@ -493,18 +630,20 @@ class TelaMascara(VisorBase):
             pt = self.para_imagem(e.position())
             self._pintar(self._ultimo, pt)
             self._ultimo = pt
-        self.update()
+        if self._img is not None:
+            self.update()
 
     def mouseReleaseEvent(self, e):
         if self._ultimo is not None:
             self._ultimo = None
             self.mudou.emit()
         self._fim_pan()
-        self.setCursor(Qt.BlankCursor)
+        self._atualizar_cursor()
 
     def leaveEvent(self, e):
         self._mouse = None
-        self.update()
+        if self._img is not None:
+            self.update()
 
     def wheelEvent(self, e):
         if e.modifiers() & Qt.AltModifier:
@@ -537,10 +676,11 @@ class TelaMascara(VisorBase):
             p.end()
             return
         r = self._retangulo_imagem()
-        self._desenhar_pix(p, self._pix, r)
-        p.setOpacity(0.55)
-        p.drawImage(r, self._mascara, QRectF(self._mascara.rect()))
-        p.setOpacity(1.0)
+        self._desenhar_pix(p, self._pix, r, img_orig=self._img)
+        if self._mascara_pix is not None:
+            p.setOpacity(0.55)
+            self._desenhar_pix(p, self._mascara_pix, r)
+            p.setOpacity(1.0)
         if self._mouse is not None and self._pan is None:
             rr = self.raio * self._escala
             p.setBrush(Qt.NoBrush)

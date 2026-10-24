@@ -25,9 +25,12 @@ def _seta():
     import tempfile
     p = os.path.join(tempfile.gettempdir(), "fluxestudio_seta.svg")
     if not os.path.isfile(p):
-        with open(p, "w") as f:
-            f.write('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#8b8b94" '
-                    'stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>')
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                f.write('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#8b8b94" '
+                        'stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>')
+        except OSError:
+            return ""
     return p.replace("\\", "/")
 
 
@@ -46,6 +49,9 @@ QPushButton#nav {{ text-align: left; padding: 10px 14px; border: none; backgroun
     font-size: 13.5px; font-weight: 500; }}
 QPushButton#nav:hover {{ background: {CARTAO}; color: {TEXTO}; }}
 QPushButton#nav:checked {{ background: {CARTAO2}; color: {TEXTO}; }}
+QPushButton#nav[arrastando="true"] {{ background: #1d1533; border: 1px dashed {ACENTO2}; color: {TEXTO}; }}
+
+#avisoTopo {{ background: #161224; border-bottom: 1px solid {ACENTO_ESCURO}; }}
 
 #cartao {{ background: {PAINEL}; border: 1px solid {BORDA}; border-radius: 14px; }}
 #titulo {{ font-size: 20px; font-weight: 700; }}
@@ -173,7 +179,13 @@ _SVG = {
 }
 
 
+_CACHE_ICONES = {}
+
+
 def icone(nome, cor=TEXTO, tamanho=20):
+    chave = (nome, cor, tamanho)
+    if chave in _CACHE_ICONES:
+        return _CACHE_ICONES[chave]
     svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="{cor}" '
            f'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">{_SVG[nome].replace("{c}", cor)}</svg>')
     r = QSvgRenderer(QByteArray(svg.encode()))
@@ -187,6 +199,7 @@ def icone(nome, cor=TEXTO, tamanho=20):
         p.end()
         pm.setDevicePixelRatio(escala)
         ic.addPixmap(pm)
+    _CACHE_ICONES[chave] = ic
     return ic
 
 

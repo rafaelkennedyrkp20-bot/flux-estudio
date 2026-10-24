@@ -1,8 +1,8 @@
 """O motor: abre o modelo escolhido e roda gerar / editar / máscara numa thread própria, para a
 interface nunca travar. torch e diffusers só são importados aqui, na primeira tarefa: a janela
-abre na hora. Funciona igual em NVIDIA (CUDA) e AMD (ROCm): os dois aparecem como torch.cuda."""
-import gc
+abre na hora. Compatível com NVIDIA (CUDA), AMD (ROCm), Intel Arc (XPU) e processadores Intel/AMD."""
 import inspect
+import json
 import logging
 import os
 import random
@@ -15,7 +15,7 @@ from PIL import Image, ImageFilter
 from PIL.PngImagePlugin import PngInfo
 from PySide6.QtCore import QObject, Signal, Slot
 
-from . import config
+from . import config, dispositivo
 from .i18n import tr
 from .modelos import POR_ID, PRINCIPAL
 
@@ -26,6 +26,10 @@ PROMPT_LIMPAR = (
     "the surrounding background, line art, colors, shading and texture seamlessly. Do not add new "
     "objects, text or symbols."
 )
+
+
+class _CanceladoPeloUsuario(Exception):
+    pass
 
 
 def multiplo(v, m=16):
@@ -42,14 +46,17 @@ def tamanho_cabendo(img, maximo, m=16):
 def tamanho_trabalho(img, m, maximo=None, mult=16):
     """Tamanho em que o modelo trabalha, sempre na proporção da imagem de entrada.
     Automático (maximo=None): até lado_auto² pixels; imagens pequenas sobem para ~768 px
-    (o modelo rende mal muito pequeno). Manual: `maximo` px no lado maior."""
+    (o modelo rende mal muito pequeno) e tiras gigantes (webtoon) têm teto de 2048 px no maior
+    lado para não estourar a atenção quadrática na placa. Manual: `maximo` px no lado maior."""
     w, h = img.size
+    maior = max(w, h)
     if maximo:
-        f = min(1.0, maximo / max(w, h))
+        f = min(1.0, maximo / maior)
     else:
-        f = min(1.0, (m.get("lado_auto", 1024) ** 2 / (w * h)) ** 0.5)
-        if max(w, h) * f < 768:
-            f = 768 / max(w, h)
+        f = min(1.0, (m.get("lado_auto", 1024) ** 2 / max(1, w * h)) ** 0.5)
+        if maior * f < 768:
+            f = 768 / maior
+        f = min(f, 2048 / maior)
     return multiplo(w * f, mult), multiplo(h * f, mult)
 
 
@@ -66,23 +73,38 @@ def corrigir_cores(gerada, original, raio=25):
     import numpy as np
     from scipy import ndimage
     gerada = gerada.convert("RGB").resize(original.size, Image.LANCZOS)
-    # A correção é de baixa frequência: calcula em 1/4 da resolução (~15x mais rápido) e amplia.
+    # A correção é de baixa frequência: calcula em 1/4 da resolução (~15x mais rápido) e amplia canal a canal.
     f = 4
     peq = (max(1, original.width // f), max(1, original.height // f))
     borrar = lambda im: np.stack([ndimage.gaussian_filter(c, raio / f) for c in
                                   np.asarray(im.resize(peq, Image.BILINEAR), dtype=np.float32).transpose(2, 0, 1)], -1)
     dif = borrar(original.convert("RGB")) - borrar(gerada)
-    dif = np.stack([np.asarray(Image.fromarray(dif[..., c]).resize(original.size, Image.BILINEAR)) for c in range(3)], -1)
-    return Image.fromarray(np.clip(np.asarray(gerada, dtype=np.float32) + dif, 0, 255).astype(np.uint8))
+    buf = np.asarray(gerada, dtype=np.float32).copy()
+    for c in range(3):
+        buf[..., c] += np.asarray(Image.fromarray(dif[..., c]).resize(original.size, Image.BILINEAR))
+    np.clip(buf, 0, 255, out=buf)
+    return Image.fromarray(buf.astype(np.uint8))
 
 
 def info_placa():
     """(nome, backend) da placa, sem abrir o modelo."""
-    import torch
-    compilacao = "ROCm" if getattr(torch.version, "hip", None) else "CUDA"
-    if torch.cuda.is_available():
-        return torch.cuda.get_device_name(0), compilacao
-    return None, "CPU:" + compilacao
+    nome, backend, _total, _livre = dispositivo.info()
+    return (nome or None), backend
+
+
+def _ativar_economia_vae(vae):
+    if vae is None:
+        return
+    if hasattr(vae, "enable_tiling"):
+        try:
+            vae.enable_tiling()
+        except Exception:  # noqa: BLE001
+            pass
+    if hasattr(vae, "enable_slicing"):
+        try:
+            vae.enable_slicing()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 class Motor(QObject):
@@ -94,15 +116,19 @@ class Motor(QObject):
     falhou = Signal(str)
     carregado = Signal(str)        # id do modelo na placa ("" = nenhum)
     carregando = Signal(str)       # id do modelo que começou a carregar (leitura do disco)
-    placa = Signal(str, str, float)  # nome, backend (CUDA/ROCm/CPU), VRAM total em GB
+    liberado = Signal()            # emitido quando a tarefa "liberar" termina de soltar a VRAM/arquivos
+    placa = Signal(str, str, float)
+    detectado = Signal(int, object, object, str)  # id, detecções, máscara, aviso/erro (aba Limpar)  # nome, backend (CUDA/ROCm/Intel XPU/CPU), VRAM total em GB
 
     def __init__(self):
         super().__init__()
-        self._id = None            # modelo aberto
-        self._pipes = {}           # modo -> pipeline
-        self._cache_prompt = {}    # prompt -> embeddings (modo rápido)
-        self._rapido = False       # FLUX.2 com transformer morando na placa
-        self._lama = None          # apagador LaMa (carregado no primeiro uso)
+        self._id = None                   # modelo aberto
+        self._pipes = {}                  # modo -> pipeline
+        self._cache_prompt = {}           # prompt -> embeddings em CPU (economiza VRAM)
+        self._rapido = False              # transformer residente na placa
+        self._usa_embeds = False          # permite guardar embeddings do prompt em cache
+        self._compartilha_direto = False  # pode criar outro modo com classe(**base.components) sem re-hookar
+        self._lama = None                 # apagador LaMa (carregado no primeiro uso)
         self.cancelar = False
 
     # ---------- modelo ----------
@@ -119,142 +145,220 @@ class Motor(QObject):
         if not self._pipes:
             self.carregando.emit(m["id"])
         import diffusers
-        import torch
 
+        dispositivo.otimizar_torch()
         t0 = time.time()
-        dtype = getattr(torch, m.get("dtype", "bfloat16"))
+        dtype = dispositivo.escolher_dtype(m.get("dtype", "bfloat16"))
         classe = getattr(diffusers, m["classes"][modo])
+
         if self._pipes:
-            # Mesmo modelo, outro modo: reaproveita os componentes já carregados (sem ler o disco de novo).
-            pipe = classe(**next(iter(self._pipes.values())).components)
-            if self._rapido:
+            # Mesmo modelo, outro modo: reaproveita os componentes já carregados na memória (sem reler o disco).
+            base_existente = next(iter(self._pipes.values()))
+            comps = dict(base_existente.components)
+            if self._compartilha_direto:
+                pipe = classe(**comps)
                 pipe.set_progress_bar_config(disable=True)
                 self._pipes[modo] = pipe
                 return m, pipe
-        elif m["tipo"] == "flux2_9b":
-            if not self._cabe_na_placa(15):
-                raise RuntimeError(tr("O {nome} precisa de uma placa de 16 GB.", nome=m["nome"]))
+            # Modelos secundários com enable_model_cpu_offload: solta os ganchos antigos antes de reencaixar
+            # para nunca acumular dois CpuOffload no mesmo módulo.
+            for ant in list(self._pipes.values()):
+                if getattr(ant, "_all_hooks", None):
+                    ant.remove_all_hooks()
+            self._pipes.clear()
+            pipe = classe(**comps)
+            if dispositivo.tem_gpu():
+                pipe.enable_model_cpu_offload(device=dispositivo.dispositivo_torch())
+            pipe.set_progress_bar_config(disable=True)
+            self._pipes[modo] = pipe
+            return m, pipe
+
+        if m["tipo"] == "flux2_9b":
             from . import klein9b
-            # GGUF Q8 do transformer na placa + Qwen3-8B int8 em memória fixada, transmitido por partes.
-            # klein9b.limitar_vram deixa 3 GB livres: sem isso o Windows joga o excesso na RAM e fica 10x mais lento.
             base = klein9b.abrir(pasta, dtype)
             base.set_progress_bar_config(disable=True)
             self._rapido = True
+            self._usa_embeds = True
+            self._compartilha_direto = True
             self._pipes["gerar"] = self._pipes["editar"] = base
             self._id = m["id"]
-            log.info("%s aberto em %.0f s", m["id"], time.time() - t0)
+            log.info("%s aberto em %.1f s", m["id"], time.time() - t0)
             self._aquecer(base)
             self.carregado.emit(m["id"])
             return self._abrir(id_modelo, modo)
-        elif m["tipo"] == "flux2" and self._cabe_na_placa():
-            # Abre sempre o pipeline base (gerar/editar) e aquece nele; a máscara reaproveita os componentes.
-            base = self._abrir_flux2_rapido(diffusers.Flux2KleinPipeline, pasta, dtype)
+
+        if m["tipo"] == "flux2":
+            _nome, _bk, total_gb, livre_gb = dispositivo.info()
+            # Modo residente rápido só quando a placa tem >= 11,5 GB E >= 9,8 GB realmente livres agora;
+            # caso contrário (placas de 6/8/10 GB ou placa de 12/16 GB ocupada pelo Photoshop/navegador),
+            # transmite o transformer em blocos pela placa sem cair na RAM compartilhada lenta do Windows.
+            residente = dispositivo.tem_gpu() and total_gb >= 11.5 and livre_gb >= 9.8
+            base = self._abrir_flux2(diffusers.Flux2KleinPipeline, pasta, dtype, residente=residente, livre_gb=livre_gb)
             self._pipes["gerar"] = self._pipes["editar"] = base
             self._id = m["id"]
-            log.info("%s aberto (modo rápido) em %.0f s", m["id"], time.time() - t0)
-            self._aquecer(base)
+            log.info("%s aberto (%s, %.1f/%.1f GB livres) em %.1f s",
+                     m["id"], "residente" if residente else "streaming", livre_gb, total_gb, time.time() - t0)
+            if residente:
+                self._aquecer(base)
             self.carregado.emit(m["id"])
             return self._abrir(id_modelo, modo)
-        else:
-            kw = dict(torch_dtype=dtype)
-            if m.get("variante"):
-                kw["variant"] = m["variante"]
-            for c in m.get("excluir", ()):
-                kw[c] = None
-            if "safety_checker" in m.get("excluir", ()):
-                kw["requires_safety_checker"] = False
-            pipe = classe.from_pretrained(pasta, **kw)
-        if torch.cuda.is_available():
-            pipe.enable_model_cpu_offload()   # 16 GB não comporta tudo junto: um componente por vez na placa
+
+        kw = dict(torch_dtype=dtype, local_files_only=True)
+        if m.get("variante"):
+            kw["variant"] = m["variante"]
+        for c in m.get("excluir", ()):
+            kw[c] = None
+        if "safety_checker" in m.get("excluir", ()):
+            kw["requires_safety_checker"] = False
+        pipe = classe.from_pretrained(pasta, **kw)
+        _ativar_economia_vae(getattr(pipe, "vae", None))
+        if dispositivo.tem_gpu():
+            pipe.enable_model_cpu_offload(device=dispositivo.dispositivo_torch())
         pipe.set_progress_bar_config(disable=True)
+        self._usa_embeds = False
+        self._compartilha_direto = not dispositivo.tem_gpu()
         self._pipes[modo] = pipe
         self._id = m["id"]
-        log.info("%s/%s aberto em %.0f s", m["id"], modo, time.time() - t0)
+        log.info("%s/%s aberto em %.1f s", m["id"], modo, time.time() - t0)
         self.carregado.emit(m["id"])
         return m, pipe
 
     @staticmethod
     def _cabe_na_placa(gb=12):
-        """12 GB+: transformer + VAE moram na placa (modo rápido). Menos que isso: um componente por vez."""
-        import torch
-        return torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memory >= gb * 2**30
+        _nome, _bk, total_gb, livre_gb = dispositivo.info()
+        return dispositivo.tem_gpu() and total_gb >= (gb - 0.5) and livre_gb >= max(4.0, gb - 2.2)
 
-    def _abrir_flux2_rapido(self, classe, pasta, dtype):
-        """Modo rápido do FLUX.2 klein. Antes, a cada imagem ~16 GB iam e voltavam da placa pelo PCIe
-        (12 s/imagem numa 5060 Ti em PCIe 3.0). Agora:
-          - transformer e VAE ficam na placa o tempo todo (bf16, qualidade original);
-          - o codificador de texto (Qwen3) perde as camadas 28-35, que o klein nunca lê (ele usa as saídas
-            9, 18 e 27; o resultado é idêntico bit a bit), e vai para a placa camada por camada, em paralelo
-            com a conta (group offload com streams), a partir de memória fixada (pinned);
-          - o prompt já lido fica guardado (_embeds), então repetir o prompt não usa o codificador.
-        (A atenção cuDNN foi testada: rápida num tamanho fixo, mas a cada tamanho novo de imagem
-        monta planos e chegou a 4-5x mais lenta. A atenção padrão fica estável.)"""
+    def _abrir_flux2(self, classe, pasta, dtype, residente=True, livre_gb=0.0):
+        """Abre o FLUX.2 klein 4B adaptando-se à placa e à RAM disponíveis:
+        - `te` (Qwen3-4B): lê do disco APENAS as camadas 0-27 (sem 28-35 nem lm_head: economiza 2,6 GB de
+          disco e RAM, idêntico bit a bit) direto em blocos `_Arena`.
+        - `residente=True` (12 GB+ com VRAM livre): transformer + VAE moram na placa com teto `limitar_vram`
+          (impede fallback lento para a RAM do Windows) e o `te` faz streaming por blocos.
+        - `residente=False` (placas de 6-10 GB ou placas de 12-16 GB ocupadas por outros apps): VAE mora na
+          placa (~170 MB, com tiling/slicing) e tanto `te` quanto `transformer` fazem streaming por blocos
+          (pico de ~3-4 GB de VRAM, mantendo cache de prompt e troca instantânea entre Gerar/Editar/Máscara).
+        - Sem GPU (CPU Intel/AMD): roda direto na CPU em bfloat16."""
         import diffusers
-        import torch
         from diffusers.hooks import apply_group_offloading
-        from transformers import Qwen3ForCausalLM
+        from . import klein9b, leitura
 
-        te = Qwen3ForCausalLM.from_pretrained(os.path.join(pasta, "text_encoder"), dtype=dtype)
-        te.model.layers = te.model.layers[:28]
-        for p in te.parameters():
-            p.data = p.data.pin_memory()
-        transformer = diffusers.Flux2Transformer2DModel.from_pretrained(
-            os.path.join(pasta, "transformer"), torch_dtype=dtype, device_map="cuda")
-        vae = diffusers.AutoencoderKLFlux2.from_pretrained(os.path.join(pasta, "vae"), torch_dtype=dtype, device_map="cuda")
-        pipe = classe.from_pretrained(pasta, text_encoder=te, transformer=transformer, vae=vae, torch_dtype=dtype)
-        # Streams paralelos só na NVIDIA: no ROCm do Windows ficam síncronos (nunca testados numa Radeon).
-        apply_group_offloading(te, onload_device=torch.device("cuda"), offload_type="leaf_level",
-                               use_stream=not getattr(torch.version, "hip", None))
-        pipe.set_progress_bar_config(disable=True)
-        self._rapido = True
-        return pipe
+        t0 = time.time()
+        tem_gpu = dispositivo.tem_gpu()
+        dev = dispositivo.dispositivo_torch()
+        usar_stream = tem_gpu and dispositivo.suporta_streams_assincronos() and dispositivo.ram_disponivel_gb() >= 11.0
+        te = transformer = vae = None
+        try:
+            if tem_gpu:
+                if residente:
+                    dispositivo.limitar_vram(1.6)
+                elif livre_gb >= 4.0:
+                    dispositivo.limitar_vram(0.9)
+
+            # Primeiro o transformer, direto do disco para a placa (não passa pela RAM); só depois o
+            # codificador de texto, que mora na RAM fixada. Na ordem inversa, os 6 GB fixados do codificador
+            # deixavam o Windows sem RAM para ler o transformer (85 s em vez de ~5 s).
+            pasta_tf = os.path.join(pasta, "transformer")
+            self.estado.emit(tr("Lendo o gerador de imagens (1/3)…"))
+            transformer = None
+            if tem_gpu and residente:
+                try:
+                    transformer = leitura.montar_na_placa(diffusers.Flux2Transformer2DModel, pasta_tf, dev, dtype)
+                except Exception:  # noqa: BLE001 - arquivo fora do padrão: cai no caminho do diffusers
+                    log.warning("leitura direta do transformer falhou; usando from_pretrained", exc_info=True)
+                    dispositivo.limpar_memoria()
+                    transformer = diffusers.Flux2Transformer2DModel.from_pretrained(
+                        pasta_tf, torch_dtype=dtype, device_map=dev.type, local_files_only=True)
+            else:
+                transformer = diffusers.Flux2Transformer2DModel.from_pretrained(
+                    pasta_tf, torch_dtype=dtype, local_files_only=True)
+            log.info("transformer em %.1f s", time.time() - t0)
+
+            self.estado.emit(tr("Lendo o codificador de texto (2/3)…"))
+            te = klein9b.carregar_qwen3_aparado(
+                os.path.join(pasta, "text_encoder"), dtype, device=dev, int8=False, fixar=usar_stream)
+            log.info("codificador de texto em %.1f s", time.time() - t0)
+
+            self.estado.emit(tr("Montando na placa de vídeo (3/3)…"))
+            vae = diffusers.AutoencoderKLFlux2.from_pretrained(
+                os.path.join(pasta, "vae"), torch_dtype=dtype, local_files_only=True)
+            _ativar_economia_vae(vae)
+            if tem_gpu:
+                vae = vae.to(dev)
+            from transformers import AutoTokenizer
+            with open(os.path.join(pasta, "model_index.json"), encoding="utf-8") as f:
+                destilado = json.load(f).get("is_distilled", False)
+            pipe = classe(
+                scheduler=diffusers.FlowMatchEulerDiscreteScheduler.from_pretrained(pasta, subfolder="scheduler"),
+                vae=vae, text_encoder=te, transformer=transformer, is_distilled=destilado,
+                tokenizer=AutoTokenizer.from_pretrained(os.path.join(pasta, "tokenizer")))
+
+            if tem_gpu:
+                klein9b.descarregar_te(te, dev, usar_stream)
+                if not residente:
+                    stream_tf = usar_stream and dispositivo.ram_disponivel_gb() >= 10.0
+                    apply_group_offloading(
+                        transformer, onload_device=dev, offload_type="block_level",
+                        num_blocks_per_group=1 if stream_tf else 2,
+                        use_stream=stream_tf, low_cpu_mem_usage=stream_tf)
+
+            pipe.set_progress_bar_config(disable=True)
+            self._rapido = bool(tem_gpu and residente)
+            self._usa_embeds = True
+            self._compartilha_direto = True
+            dispositivo.limpar_memoria()
+            return pipe
+        except BaseException:
+            del te, transformer, vae
+            dispositivo.restaurar_vram()
+            dispositivo.limpar_memoria(liberar_fixada=True)
+            raise
 
     def _aquecer(self, pipe):
-        """Uma geração mínima logo após abrir: a 1ª imagem de verdade já sai na velocidade normal."""
+        """Uma geração mínima (256²) logo após abrir: a 1ª imagem de verdade já sai na velocidade normal."""
         import torch
         self.estado.emit(tr("Preparando a placa…"))
         try:
             with torch.inference_mode():
-                pipe(prompt_embeds=self._embeds(pipe, "warmup"), width=512, height=512, num_inference_steps=1,
-                     guidance_scale=1.0, generator=torch.Generator("cpu").manual_seed(0))
+                pipe(prompt_embeds=self._embeds(pipe, "warmup"), width=256, height=256, num_inference_steps=1,
+                     guidance_scale=1.0, generator=torch.Generator("cpu").manual_seed(0), output_type="latent")
+            dispositivo.sincronizar()
+            dispositivo.limpar_memoria()
         except Exception:  # noqa: BLE001 - aquecer é opcional
             log.warning("aquecimento falhou", exc_info=True)
 
     def _embeds(self, pipe, prompt):
-        """Prompt -> embeddings, uma vez por prompt (só no modo rápido: com offload por modelo,
-        chamar encode_prompt por fora desmonta os ganchos e fica lento)."""
+        """Prompt -> embeddings, uma vez por prompt; guarda em CPU (~7-15 MB) para não ocupar VRAM."""
         if prompt not in self._cache_prompt:
             import torch
             if prompt != "warmup":
                 self.estado.emit(tr("Lendo o prompt…"))
             with torch.inference_mode():
                 emb = pipe.encode_prompt(prompt, device=pipe._execution_device)[0]
-            if len(self._cache_prompt) >= 32:
+            if len(self._cache_prompt) >= 24:
                 self._cache_prompt.pop(next(iter(self._cache_prompt)))
-            self._cache_prompt[prompt] = emb
-        return self._cache_prompt[prompt]
+            self._cache_prompt[prompt] = emb.detach().to("cpu")
+            del emb
+        return self._cache_prompt[prompt].to(device=pipe._execution_device)
 
     def _liberar(self):
-        had = bool(self._pipes)
-        era_9b = self._id == "flux2-klein-9b"
+        had = bool(self._pipes) or (self._lama is not None)
+        for ant in list(self._pipes.values()):
+            if getattr(ant, "_all_hooks", None):
+                try:
+                    ant.remove_all_hooks()
+                except Exception:  # noqa: BLE001
+                    pass
         self._pipes.clear()
         self._cache_prompt.clear()
         self._rapido = False
+        self._usa_embeds = False
+        self._compartilha_direto = False
         if self._lama is not None:
             self._lama.descarregar()
             self._lama = None
         self._id = None
-        gc.collect()
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                if era_9b:
-                    from . import klein9b
-                    klein9b.liberar_ram_fixada()
-                    torch.cuda.set_per_process_memory_fraction(1.0)
-        except ImportError:
-            pass
+        dispositivo.restaurar_vram()
+        dispositivo.limpar_memoria(liberar_fixada=True)
         if had:
             self.carregado.emit("")
 
@@ -266,26 +370,32 @@ class Motor(QObject):
             tipo = t["tipo"]
             if tipo == "info":
                 # Importa torch/diffusers já na abertura (em segundo plano): a 1ª geração fica mais rápida.
-                import torch
                 import diffusers  # noqa: F401
                 from scipy import ndimage  # noqa: F401 - usado no "acertar as cores"
-                nome, backend = info_placa()
-                total = torch.cuda.get_device_properties(0).total_memory / 2**30 if nome else 0.0
-                self.placa.emit(nome or "", backend, total)
+                nome, backend, total, _livre = dispositivo.info()
+                self.placa.emit(nome, backend, total)
             elif tipo == "carregar":
                 self._abrir(t.get("modelo", PRINCIPAL["id"]), t.get("modo", "gerar"))
                 self.carregado.emit(self._id or "")  # mesmo se já estava aberto: a tela sai de "carregando"
                 self.estado.emit(tr("Modelo pronto na placa de vídeo"))
             elif tipo == "liberar":
-                self._liberar()
-                self.estado.emit(tr("Placa de vídeo liberada"))
+                try:
+                    self._liberar()
+                    self.estado.emit(tr("Placa de vídeo liberada"))
+                finally:
+                    self.liberado.emit()  # apagar modelo / testar placa esperam por isto
             else:
                 getattr(self, "_" + tipo)(t)
         except Exception as e:  # noqa: BLE001 - qualquer erro vira aviso na interface
+            if self.cancelar and e.__class__.__name__ in ("Cancelado", "_CanceladoPeloUsuario"):
+                self._terminar(t.get("tipo", "gerar"), [], "", 0)
+                return
             log.error("falha em %s\n%s", t.get("tipo"), traceback.format_exc())
+            dispositivo.limpar_memoria()
             msg = str(e)
-            if "out of memory" in msg.lower():
-                msg = tr("Faltou memória na placa de vídeo. Feche outros programas pesados ou diminua o tamanho.")
+            baixo = msg.lower()
+            if "out of memory" in baixo or "not enough memory" in baixo or "bad alloc" in baixo:
+                msg = tr("Faltou memória na placa de vídeo ou na RAM. Feche outros programas pesados ou diminua o tamanho.")
             self.falhou.emit(msg)
 
     def _rodar(self, m, pipe, t, **kw):
@@ -294,10 +404,9 @@ class Motor(QObject):
         n, passos, prompt = int(t["quantas"]), int(t["passos"]), t["prompt"]
         semente = t.get("semente", -1)
         s = int(semente) if semente is not None and int(semente) >= 0 else random.randint(0, 2**31 - 1)
-        if self._rapido and m["tipo"].startswith("flux2"):
+        if self._usa_embeds and m["tipo"].startswith("flux2"):
             kw["prompt_embeds"] = self._embeds(pipe, prompt)
         else:
-            # Com offload por modelo, sempre pelo prompt: chamar encode_prompt por fora desmonta os ganchos.
             kw["prompt"] = prompt
         kw["guidance_scale"] = 1.0 if m["tipo"].startswith("flux2") else float(t.get("guia", m["guia"]))
         params = inspect.signature(pipe.__call__).parameters
@@ -309,6 +418,7 @@ class Motor(QObject):
             self.passo.emit(min(feitos[0], total), total)
             if self.cancelar:
                 p._interrupt = True
+                raise _CanceladoPeloUsuario()
             return cb
 
         if "callback_on_step_end" in params:
@@ -319,7 +429,12 @@ class Motor(QObject):
                 break
             self.estado.emit(tr("Imagem {a} de {b}", a=k + 1, b=n) if n > 1 else tr("Gerando…"))
             g = torch.Generator("cpu").manual_seed(s + k)
-            out = pipe(generator=g, num_images_per_prompt=1, num_inference_steps=passos, **kw).images
+            try:
+                out = pipe(generator=g, num_images_per_prompt=1, num_inference_steps=passos, **kw).images
+            except _CanceladoPeloUsuario:
+                if hasattr(pipe, "maybe_free_model_hooks"):
+                    pipe.maybe_free_model_hooks()
+                break
             if self.cancelar:
                 break
             imgs.append((out[0], s + k))
@@ -396,6 +511,11 @@ class Motor(QObject):
         base = fundo
         if t.get("preencher_lama"):
             base = self._lama_limpar(fundo, mascara)
+            if self._lama is not None and (not self._rapido or m["tipo"] == "flux2_9b"):
+                self._lama.mover_cpu()
+        if self.cancelar:
+            self._terminar("mascara", [], "", 0)
+            return
         caixa = caixa_trabalho(mascara, 0.5, 128)
         rec, rec_m = base.crop(caixa), mascara.crop(caixa)
         w, h = tamanho_trabalho(rec, m, t.get("maximo"))
@@ -419,12 +539,37 @@ class Motor(QObject):
         from . import lama
         if not lama.instalado():
             self.estado.emit(tr("Baixando o LaMa de mangá (~200 MB, só na primeira vez)…"))
-            lama.baixar(cancelado=lambda: self.cancelar)
+            lama.baixar(
+                ao_progresso=lambda f, tot, _v, _a: self.passo.emit(int(f // 2**20), max(1, int(tot // 2**20))),
+                cancelado=lambda: self.cancelar,
+            )
         if self._lama is None:
             self._lama = lama.Lama()
-            self._lama.carregar()
+        self._lama.carregar()
         self.estado.emit(tr("Limpando com o LaMa…"))
-        return self._lama.limpar(imagem, mascara)
+        return self._lama.limpar(
+            imagem, mascara,
+            ao_progresso=lambda i, n: self.passo.emit(i, max(1, n)),
+            cancelado=lambda: self.cancelar,
+        )
+
+    def _detectar(self, t):
+        """Aba Limpar: acha texto e balões (ONNX na CPU). Roda aqui, no processo do motor, para a janela
+        não engasgar enquanto o onnxruntime abre e calcula."""
+        ident = t["id"]
+        try:
+            from . import detector
+            if not detector.instalado():
+                self.detectado.emit(ident, None, None, tr("Baixando o detector de texto (só na primeira vez)…"))
+                detector.baixar()
+            if getattr(self, "_detector", None) is None:
+                self._detector = detector.Detector()
+            dets = self._detector.detectar(t["imagem"])
+            msk = self._detector.mascara_texto(t["imagem"], incluir_baloes=t.get("baloes", False), deteccoes=dets)
+            self.detectado.emit(ident, dets, msk, "")
+        except Exception as e:  # noqa: BLE001
+            log.warning("detecção falhou", exc_info=True)
+            self.detectado.emit(ident, None, None, "erro:" + str(e)[:200])
 
     def _limpar(self, t):
         """Aba Limpar: só o LaMa (rápido, sem o FLUX)."""

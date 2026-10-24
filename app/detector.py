@@ -18,7 +18,7 @@ import time
 import numpy as np
 from PIL import Image, ImageDraw
 
-from . import config
+from . import config, dispositivo
 
 log = logging.getLogger("detector")
 
@@ -45,8 +45,13 @@ class Cancelado(Exception):
 
 # ---------------------------------------------------------------- download
 
+def _arquivo():
+    return os.path.join(config.pasta_modelo(ID), NOME_ARQ)
+
+
 def instalado():
-    return os.path.isfile(ARQUIVO) and os.path.getsize(ARQUIVO) == TAMANHO
+    arq = _arquivo()
+    return os.path.isfile(arq) and os.path.getsize(arq) == TAMANHO
 
 
 def _baixar_arquivo(url, final, tamanho, ao_progresso=None, cancelado=None):
@@ -63,6 +68,8 @@ def _baixar_arquivo(url, final, tamanho, ao_progresso=None, cancelado=None):
     if token:
         cab["Authorization"] = f"Bearer {token}"
     for tentativa in range(6):
+        if cancelado():
+            raise Cancelado()
         feito = os.path.getsize(parte) if os.path.isfile(parte) else 0
         if feito > tamanho:  # .part estranho: recomeça
             os.remove(parte)
@@ -70,8 +77,15 @@ def _baixar_arquivo(url, final, tamanho, ao_progresso=None, cancelado=None):
         if feito == tamanho:
             break
         try:
-            with requests.get(url, headers=dict(cab, Range=f"bytes={feito}-"), stream=True, timeout=(15, 60)) as r:
-                if r.status_code == 200:  # servidor ignorou o Range: recomeça do zero
+            hdrs = dict(cab)
+            if feito > 0:
+                hdrs["Range"] = f"bytes={feito}-"
+            with requests.get(url, headers=hdrs, stream=True, timeout=(15, 60)) as r:
+                if r.status_code == 416:
+                    if os.path.isfile(parte):
+                        os.remove(parte)
+                    continue
+                if r.status_code == 200:  # servidor ignorou o Range (ou pedido do zero): grava do início
                     feito = 0
                 elif r.status_code != 206:
                     raise IOError(f"HTTP {r.status_code} em {nome}")
@@ -93,7 +107,7 @@ def _baixar_arquivo(url, final, tamanho, ao_progresso=None, cancelado=None):
         except Cancelado:
             raise
         except Exception:
-            if tentativa == 5:
+            if tentativa == 5 or cancelado():
                 raise
             log.warning("falha baixando %s, tentando de novo", nome, exc_info=True)
             time.sleep(2 * (tentativa + 1))
@@ -106,9 +120,10 @@ def _baixar_arquivo(url, final, tamanho, ao_progresso=None, cancelado=None):
 
 def baixar(ao_progresso=None, cancelado=None):
     """Baixa o modelo (se faltar). Retorna o caminho do arquivo. Levanta Cancelado."""
-    if instalado():
-        return ARQUIVO
-    return _baixar_arquivo(URL, ARQUIVO, TAMANHO, ao_progresso, cancelado)
+    arq = _arquivo()
+    if os.path.isfile(arq) and os.path.getsize(arq) == TAMANHO:
+        return arq
+    return _baixar_arquivo(URL, arq, TAMANHO, ao_progresso, cancelado)
 
 
 # ---------------------------------------------------------------- caixas
@@ -168,19 +183,26 @@ def _juntar(dets, vertical=True, cobre=0.5):
 class Detector:
     def __init__(self):
         self.sessao = None
+        self._caminho = None
 
     def carregar(self):
-        if self.sessao is None:
+        arq = _arquivo()
+        if self.sessao is None or self._caminho != arq:
             import onnxruntime as ort
-            if not instalado():
-                raise FileNotFoundError(ARQUIVO)
+            if not (os.path.isfile(arq) and os.path.getsize(arq) == TAMANHO):
+                raise FileNotFoundError(arq)
             op = ort.SessionOptions()
             op.log_severity_level = 3
-            self.sessao = ort.InferenceSession(ARQUIVO, op, providers=["CPUExecutionProvider"])
+            op.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            op.intra_op_num_threads = min(8, dispositivo.nucleos_fisicos())
+            op.inter_op_num_threads = 1
+            self.sessao = ort.InferenceSession(arq, op, providers=["CPUExecutionProvider"])
+            self._caminho = arq
         return self
 
     def descarregar(self):
         self.sessao = None
+        self._caminho = None
 
     def _rodar(self, img, limiar):
         """img RGB PIL -> lista de detecções em pixels de `img`."""
@@ -201,18 +223,22 @@ class Detector:
             saida.append({"classe": CLASSES[int(r)], "caixa": (x0, y0, x1, y1), "score": float(s)})
         return saida
 
-    def detectar(self, imagem, limiar=LIMIAR):
+    def detectar(self, imagem, limiar=LIMIAR, cancelado=None):
         """-> [{"classe": "bubble"|"text_bubble"|"text_free", "caixa": (x0, y0, x1, y1), "score"}]
         com caixas em pixels da imagem original."""
         self.carregar()
         imagem = imagem.convert("RGB")
         janelas = _pedacos(*imagem.size)
         if len(janelas) == 1:
+            if cancelado and cancelado():
+                raise Cancelado()
             return self._rodar(imagem, limiar)
         w, h = imagem.size
         vertical = h >= w
         dets = []
         for x0, y0, x1, y1 in janelas:
+            if cancelado and cancelado():
+                raise Cancelado()
             # emendas internas deste pedaço (a borda da imagem não conta)
             ini, fim, tam = (y0, y1, h) if vertical else (x0, x1, w)
             tol = max(4, 0.02 * (fim - ini))

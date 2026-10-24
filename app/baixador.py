@@ -116,6 +116,8 @@ class Baixador:
                 with sessao.get(self._url(caminho), headers=cab, stream=True, timeout=(15, 60)) as r:
                     if r.status_code not in (200, 206):
                         raise IOError(f"HTTP {r.status_code} em {caminho}")
+                    if r.status_code == 200 and (ini > 0 or fim - ini + 1 != int(r.headers.get("Content-Length", -1))):
+                        raise IOError(f"servidor ignorou o Range em {caminho}")
                     with open(parte, "r+b") as f:
                         f.seek(ini)
                         for bloco in r.iter_content(1024 * 1024):
@@ -137,7 +139,7 @@ class Baixador:
                 raise
             except Exception:
                 self._somar(-recebidos)
-                if tentativa == 5:
+                if tentativa == 5 or self._cancelar.is_set():
                     raise
                 time.sleep(2 * (tentativa + 1))
 

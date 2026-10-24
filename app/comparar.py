@@ -8,7 +8,7 @@ from PySide6.QtWidgets import QDialog, QFrame, QHBoxLayout, QLabel, QPushButton,
 
 from . import tema
 from .i18n import tr
-from .widgets import Segmentado, Toast, VisorBase, copiar_imagem, rotulo
+from .widgets import Segmentado, Toast, VisorBase, _pixmap_exibicao, copiar_imagem, rotulo
 
 
 def _etiqueta(p, texto, x, y, direita=False, cor="white"):
@@ -30,17 +30,17 @@ def _etiqueta(p, texto, x, y, direita=False, cor="white"):
 
 def _copiar_vista(de, para):
     """Leva zoom e posição de um visor para outro em coordenadas normalizadas da imagem
-    (funciona mesmo se as duas imagens tiverem tamanhos diferentes)."""
-    if de._pix is None or para._pix is None:
+    (funciona mesmo se as duas imagens tiverem tamanhos diferentes ou tiras longas)."""
+    if de._img is None or para._img is None:
         return
     para._anim.stop()
     if de._auto:
         para.ajustar()
         return
     centro = de.para_imagem(QPointF(de.width() / 2, de.height() / 2))
-    nx, ny = centro.x() / de._pix.width(), centro.y() / de._pix.height()
-    para._escala = de._escala * de._pix.width() / para._pix.width()
-    alvo = QPointF(nx * para._pix.width(), ny * para._pix.height())
+    nx, ny = centro.x() / max(1, de._img.width()), centro.y() / max(1, de._img.height())
+    para._escala = de._escala * de._img.width() / max(1, para._img.width())
+    alvo = QPointF(nx * para._img.width(), ny * para._img.height())
     para._desl = QPointF(para.width() / 2, para.height() / 2) - alvo * para._escala
     para._auto = False
     para.update()
@@ -58,7 +58,8 @@ class VisorComparar(VisorBase):
         self.etiqueta = etiqueta
         self.mostrar_antes = False
         self.marca = None  # ponto normalizado vindo do outro lado (lado a lado)
-        self._antes_pix = QPixmap.fromImage(antes) if antes is not None else None
+        self._antes_img = antes if (antes is not None and not antes.isNull()) else None
+        self._antes_pix = _pixmap_exibicao(self._antes_img)
         self._linha = 0.5  # fração da largura do visor (fica no lugar com zoom)
         self._arrastando = False
         self.definir_imagem(img)
@@ -73,8 +74,10 @@ class VisorComparar(VisorBase):
             self.unsetCursor()
 
     def _normalizado(self, pos):
+        if self._img is None:
+            return None
         pt = self.para_imagem(pos)
-        nx, ny = pt.x() / self._pix.width(), pt.y() / self._pix.height()
+        nx, ny = pt.x() / max(1, self._img.width()), pt.y() / max(1, self._img.height())
         return QPointF(nx, ny) if 0 <= nx <= 1 and 0 <= ny <= 1 else None
 
     def _mover_linha(self, x):
@@ -150,10 +153,12 @@ class VisorComparar(VisorBase):
         # plaquinhas dentro da imagem quando ela cabe; senão, no canto do visor
         esq, dir_, topo = max(12.0, r.left() + 12), min(self.width() - 12.0, r.right() - 12), max(12.0, r.top() + 12)
         ver_antes = self.modo == "alternar" and self.mostrar_antes and self._antes_pix is not None
-        self._desenhar_pix(p, self._antes_pix if ver_antes else self._pix, r)
+        self._desenhar_pix(p, self._antes_pix if ver_antes else self._pix, r,
+                           img_orig=self._antes_img if ver_antes else self._img)
         if self.modo == "deslizar" and self._antes_pix is not None:
             x = self.width() * self._linha
-            self._desenhar_pix(p, self._antes_pix, r, QRectF(r.x(), r.y(), max(0.0, x - r.x()), r.height()))
+            self._desenhar_pix(p, self._antes_pix, r, QRectF(r.x(), r.y(), max(0.0, x - r.x()), r.height()),
+                               img_orig=self._antes_img)
             self._pintar_linha(p, x, r)
             _etiqueta(p, tr("ANTES"), esq, topo)
             _etiqueta(p, tr("DEPOIS"), dir_, topo, direita=True)

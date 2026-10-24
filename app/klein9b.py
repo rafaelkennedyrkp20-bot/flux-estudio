@@ -346,25 +346,49 @@ def baixar(pasta, ao_progresso=None, cancelado=None, pasta_4b=None):
 
 
 class _Arena:
-    """Memória fixada (pinned) em blocos grandes, repartida entre muitos tensores.
+    """Memória em blocos grandes (fixada/pinned quando `fixar=True`), repartida entre muitos tensores.
     O alocador de memória fixada do PyTorch arredonda cada pedido para a potência de 2 seguinte
     (96 MB viram 128 MB, a tabela de embeddings de 1,19 GB vira 2 GB): fixando tensor a tensor, os
-    11,2 GB do Qwen3 aparado ocupavam ~18 GB. Em blocos de potência de 2, a perda é só o fim de cada bloco."""
+    11,2 GB do Qwen3 aparado ocupavam ~18 GB. Em blocos de potência de 2, a perda é só o fim de cada bloco.
+    Em PCs com pouca RAM livre ou no ROCm (sem streams assíncronos), `fixar=False` usa RAM paginável normal."""
 
-    def __init__(self, tam_bloco):
+    def __init__(self, tam_bloco, fixar=True):
         self.tam = tam_bloco
+        self.fixar = bool(fixar)
         self.blocos = []
         self.pos = 0
+
+    def _alocar(self, forma, dtype):
+        import torch
+        if self.fixar:
+            try:
+                return torch.empty(forma, dtype=dtype, device="cpu", pin_memory=True)
+            except RuntimeError:
+                # Se o Windows recusar fixar mais páginas físicas, cai para RAM comum sem falhar.
+                self.fixar = False
+        return torch.empty(forma, dtype=dtype, device="cpu")
+
+    def reservar(self, n):
+        """Um pedaço uint8 de `n` bytes (alinhado a 512) para a leitura direta do disco escrever nele."""
+        import torch
+        if n > self.tam:
+            return self._alocar((n,), torch.uint8)
+        if not self.blocos or self.pos + n > self.tam:
+            self.blocos.append(self._alocar((self.tam,), torch.uint8))
+            self.pos = 0
+        out = self.blocos[-1][self.pos:self.pos + n]
+        self.pos += (n + 511) // 512 * 512
+        return out
 
     def copiar(self, t):
         import torch
         n = t.numel() * t.element_size()
         if n > self.tam:
-            out = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=True)
+            out = self._alocar(t.shape, t.dtype)
             out.copy_(t)
             return out
         if not self.blocos or self.pos + n > self.tam:
-            self.blocos.append(torch.empty(self.tam, dtype=torch.uint8, device="cpu", pin_memory=True))
+            self.blocos.append(self._alocar((self.tam,), torch.uint8))
             self.pos = 0
         out = self.blocos[-1][self.pos:self.pos + n].view(t.dtype).view(t.shape)
         self.pos += (n + 511) // 512 * 512
@@ -438,15 +462,46 @@ def _classes_int8():
 _CLASSES_INT8 = None
 
 
-def _carregar_te(pasta_te, dtype, device, int8):
-    """Monta o Qwen3-8B aparado tensor a tensor: disco (safetensors) -> placa -> [int8] -> RAM fixada.
-    Nunca existe uma cópia inteira em bf16 na RAM comum, e a memória fixada vem em blocos (_Arena): a RAM
-    fica perto do tamanho final (~5,7 GB em int8, ~11,2 GB em bf16). Só lê as camadas 0-27; o lm_head
-    não é lido."""
+def descarregar_te(te, dev, usar_stream):
+    """Codificador de texto mora na RAM e passa pela placa camada a camada na hora de ler o prompt.
+    Aplicado em `te.model`, não em `te`: com `block_modules=["model"]` e streams, o diffusers põe um gancho
+    "preguiçoso" em `te` (por causa do lm_head=Identity) e outro em `te.model`, e o segundo estoura
+    "layer_execution_tracker already exists" — o modelo nunca abria com RAM folgada.
+    `low_cpu_mem_usage=True`: os pesos já estão em RAM fixada (_Arena); sem isso o diffusers chamava
+    pin_memory() em cada um de novo, o que às vezes falhava com "CUDA error: resource already mapped".
+    Se ainda assim falhar, tira os ganchos pela metade e usa o modo sem streams (um pouco mais lento)."""
+    import logging
+    from diffusers.hooks import apply_group_offloading
+
+    def aplicar(stream):
+        apply_group_offloading(te.model, onload_device=dev, offload_type="block_level",
+                               num_blocks_per_group=1 if stream else 2, use_stream=stream, low_cpu_mem_usage=stream)
+
+    if not usar_stream:
+        return aplicar(False)
+    try:
+        aplicar(True)
+    except RuntimeError:
+        logging.getLogger("klein9b").warning("offload com streams falhou; sem streams", exc_info=True)
+        for sub in te.model.modules():
+            reg = getattr(sub, "_diffusers_hook", None)
+            for nome in list(getattr(reg, "hooks", {})):
+                reg.remove_hook(nome, recurse=False)
+        aplicar(False)
+
+
+def carregar_qwen3_aparado(pasta_te, dtype, device=None, int8=False, fixar=None, cancelado=None):
+    """Monta o Qwen3 (4B ou 8B) aparado tensor a tensor: disco (safetensors) -> [int8] -> RAM em blocos.
+    Nunca existe uma cópia inteira extra na RAM comum, e só lê as camadas 0-27 (o klein lê as saídas
+    9, 18 e 27; o lm_head e as camadas 28-35 nem saem do disco — resultado idêntico bit a bit)."""
     import torch
     from accelerate import init_empty_weights
     from safetensors import safe_open
     from transformers import AutoConfig, Qwen3ForCausalLM
+    from . import dispositivo
+
+    if fixar is None:
+        fixar = dispositivo.suporta_streams_assincronos() and dispositivo.ram_disponivel_gb() >= (9.5 if int8 else 11.0)
 
     cfg = AutoConfig.from_pretrained(pasta_te)
     cfg.num_hidden_layers = CAMADAS_TE
@@ -461,20 +516,43 @@ def _carregar_te(pasta_te, dtype, device, int8):
     bloco = 256 * 2**20
     while bloco < maior:
         bloco *= 2
-    arena = _Arena(bloco)
+    arena = _Arena(bloco, fixar=fixar)
 
-    with open(os.path.join(pasta_te, "model.safetensors.index.json"), encoding="utf-8") as f:
-        mapa = json.load(f)["weight_map"]
+    # Se int8=True e houver >= 2,8 GB livres na placa, quantiza na placa (muito rápido);
+    # se a placa estiver apertada (ou int8=False), lê direto na CPU sem tocar na VRAM.
+    dev_quant = torch.device("cpu")
+    if int8 and device is not None and torch.device(device).type != "cpu":
+        mem = dispositivo.memoria_info()
+        if mem is None or (mem[1] - mem[0]) >= 2.8 * 2**30:
+            dev_quant = torch.device(device)
+
+    arq_indice = os.path.join(pasta_te, "model.safetensors.index.json")
     precisa = dict(te.named_parameters())
     por_arquivo = {}
-    for nome in precisa:
-        por_arquivo.setdefault(mapa[nome], []).append(nome)
+    if os.path.isfile(arq_indice):
+        with open(arq_indice, encoding="utf-8") as f:
+            mapa = json.load(f)["weight_map"]
+        for nome in precisa:
+            por_arquivo.setdefault(mapa[nome], []).append(nome)
+    else:
+        por_arquivo["model.safetensors"] = list(precisa)
+
     feitos = set()
-    with torch.no_grad():
+    if not int8:
+        # bf16 sem quantizar: cada tensor sai do disco direto para o seu lugar no bloco (sem cópia no meio).
+        from . import leitura
         for arq, nomes in por_arquivo.items():
+            lidos = leitura.para_ram(os.path.join(pasta_te, arq), nomes, arena.reservar, dtype, cancelado)
+            for nome, t in lidos.items():
+                dono_nome, _, folha = nome.rpartition(".")
+                te.get_submodule(dono_nome)._parameters[folha] = torch.nn.Parameter(t, requires_grad=False)
+                feitos.add(nome)
+    with torch.no_grad():
+        for arq, nomes in ({} if not int8 else por_arquivo).items():
             with safe_open(os.path.join(pasta_te, arq), framework="pt", device="cpu") as f:
                 for nome in nomes:
-                    t = f.get_tensor(nome).to(device=device, dtype=dtype)   # do mmap direto para a placa
+                    bruto = f.get_tensor(nome)
+                    t = bruto.to(device=dev_quant, dtype=dtype) if (int8 or bruto.dtype != dtype) else bruto
                     dono_nome, _, folha = nome.rpartition(".")
                     dono = te.get_submodule(dono_nome)
                     pai, _, filho = dono_nome.rpartition(".")
@@ -485,7 +563,7 @@ def _carregar_te(pasta_te, dtype, device, int8):
                     else:
                         dono._parameters[folha] = torch.nn.Parameter(arena.copiar(t), requires_grad=False)
                     feitos.add(nome)
-                    del t
+                    del t, bruto
     falta = [n for n in precisa if n not in feitos]
     if falta:
         raise RuntimeError(f"pesos do codificador de texto não encontrados: {falta[:3]}")
@@ -494,17 +572,15 @@ def _carregar_te(pasta_te, dtype, device, int8):
     return te
 
 
+def _carregar_te(pasta_te, dtype, device, int8):
+    return carregar_qwen3_aparado(pasta_te, dtype, device=device, int8=int8)
+
+
 def liberar_ram_fixada():
     """Depois de soltar o pipeline: devolve ao Windows a memória fixada que o PyTorch guarda em cache
     (sem isso, os ~6-12 GB do codificador de texto continuam presos ao processo)."""
-    import gc
-    import torch
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        esvaziar = getattr(torch._C, "_host_emptyCache", None)
-        if esvaziar:
-            esvaziar()
+    from . import dispositivo
+    dispositivo.limpar_memoria(liberar_fixada=True)
 
 
 def _ler_gguf(caminho):
@@ -531,15 +607,9 @@ def _ler_gguf(caminho):
 
 
 def limitar_vram(reserva_gb=3.0):
-    """Faz o PyTorch nunca passar de (VRAM total - reserva_gb). No Windows, passar do limite da placa não
-    dá erro: o driver joga o excesso na RAM ("sysmem fallback") e cada passo fica 15-20x mais lento
-    (medido: 2,8 s -> 47 s por passo na edição 1024² do 9B). Com o teto, o alocador do PyTorch
-    devolve o cache e reaproveita antes de chegar lá. Vale para o processo inteiro."""
-    import torch
-    total = torch.cuda.get_device_properties(0).total_memory
-    fracao = max(0.5, min(1.0, (total - reserva_gb * 2**30) / total))
-    torch.cuda.set_per_process_memory_fraction(fracao, 0)
-    return fracao
+    """Faz o PyTorch nunca passar de (VRAM total - reserva_gb), respeitando também o que outros programas ocupam."""
+    from . import dispositivo
+    return dispositivo.limitar_vram(reserva_gb)
 
 
 def abrir(pasta, dtype=None, te_int8=True, reserva_vram_gb=3.0):
@@ -547,48 +617,70 @@ def abrir(pasta, dtype=None, te_int8=True, reserva_vram_gb=3.0):
     A máscara usa os mesmos pesos: diffusers.Flux2KleinInpaintPipeline(**pipe.components).
 
     Na placa: transformer Q8_0 (~9,3 GB) + VAE (~0,16 GB) + ativações (pico ~12 GB alocados na edição
-    1024² com 1 referência). Na RAM, fixado: Qwen3-8B aparado (28 camadas, sem lm_head), ~5,7 GB em
-    int8 (te_int8=True; embeddings com erro relativo ~1,4%, imagens com a mesma composição) ou ~11,2 GB
-    em bf16 (idêntico ao original). Pico de RAM do processo ao abrir: ~10,5 GB.
+    1024² com 1 referência). Na RAM: Qwen3-8B aparado (28 camadas, sem lm_head), ~5,7 GB em int8
+    (te_int8=True; embeddings com erro relativo ~1,4%, imagens com a mesma composição) ou ~11,2 GB em bf16.
     reserva_vram_gb: deixada livre para o Windows/desktop/Photoshop (ver limitar_vram); None = sem teto.
     Ao fechar: soltar o pipeline e chamar liberar_ram_fixada()."""
     import diffusers
     import torch
     from diffusers import GGUFQuantizationConfig
-    from diffusers.hooks import apply_group_offloading
+    from . import dispositivo
+    from .i18n import tr
 
-    dtype = dtype or torch.bfloat16
-    if not torch.cuda.is_available():
-        raise RuntimeError("O FLUX.2 klein 9B precisa de uma placa de vídeo (CUDA/ROCm).")
+    dispositivo.otimizar_torch()
+    if not dispositivo.tem_gpu():
+        raise RuntimeError(tr("O FLUX.2 klein 9B precisa de uma placa de vídeo (NVIDIA, AMD ou Intel Arc)."))
+    _nome, _bk, total_gb, livre_gb = dispositivo.info()
+    if total_gb < 14.5:
+        raise RuntimeError(tr("O {nome} precisa de uma placa de 16 GB.", nome=NOME))
+    if livre_gb < 12.3:  # pico medido ~12 GB numa edição 1024²
+        raise RuntimeError(tr(
+            "A placa tem {livre} GB livres agora (o 9B precisa de pelo menos ~12,5 GB livres). "
+            "Feche outros programas que estejam usando a placa de vídeo ou use o FLUX.2 4B.",
+            livre=f"{livre_gb:.1f}",
+        ))
+    dtype = dtype or dispositivo.escolher_dtype("bfloat16")
     falta = faltando(pasta)
     if falta:
         raise RuntimeError(f"O {NOME} não está completo em {pasta}: faltam {', '.join(falta[:3])}"
                            + ("…" if len(falta) > 3 else ""))
     _escrever_config(pasta)
-    cuda = torch.device("cuda")
-    if reserva_vram_gb is not None:
-        limitar_vram(reserva_vram_gb)
+    dev = dispositivo.dispositivo_torch()
+    usar_stream = dispositivo.suporta_streams_assincronos() and dispositivo.ram_disponivel_gb() >= 9.5
+    transformer = vae = te = None
+    try:
+        if reserva_vram_gb is not None:
+            limitar_vram(reserva_vram_gb)
 
-    # 1) Transformer GGUF: do arquivo mapeado (mmap) direto para a placa, tensor a tensor.
-    estado = _ler_gguf(os.path.join(pasta, "transformer", ARQ_GGUF))
-    transformer = diffusers.Flux2Transformer2DModel.from_single_file(
-        estado, config=os.path.join(pasta, "transformer"),
-        quantization_config=GGUFQuantizationConfig(compute_dtype=dtype),
-        torch_dtype=dtype, device=cuda, local_files_only=True)
-    del estado
-    transformer.to(cuda)
-    vae = diffusers.AutoencoderKLFlux2.from_pretrained(os.path.join(pasta, "vae"), torch_dtype=dtype, device_map="cuda")
+        # 1) Transformer GGUF: do arquivo mapeado (mmap) direto para a placa, tensor a tensor.
+        estado = _ler_gguf(os.path.join(pasta, "transformer", ARQ_GGUF))
+        transformer = diffusers.Flux2Transformer2DModel.from_single_file(
+            estado, config=os.path.join(pasta, "transformer"),
+            quantization_config=GGUFQuantizationConfig(compute_dtype=dtype),
+            torch_dtype=dtype, device=dev, local_files_only=True)
+        del estado
+        transformer.to(dev)
+        vae = diffusers.AutoencoderKLFlux2.from_pretrained(
+            os.path.join(pasta, "vae"), torch_dtype=dtype, local_files_only=True).to(dev)
+        if hasattr(vae, "enable_tiling"):
+            vae.enable_tiling()
+        if hasattr(vae, "enable_slicing"):
+            vae.enable_slicing()
 
-    # 2) Qwen3-8B: só as 28 primeiras camadas (o klein lê hidden_states 9/18/27; o resultado é idêntico
-    #    bit a bit ao modelo inteiro), tensor a tensor, direto para a RAM fixada.
-    te = _carregar_te(os.path.join(pasta, "text_encoder"), dtype, cuda, te_int8)
-    torch.cuda.empty_cache()
-    pipe = diffusers.Flux2KleinPipeline.from_pretrained(
-        pasta, text_encoder=te, transformer=transformer, vae=vae, torch_dtype=dtype, local_files_only=True)
-    apply_group_offloading(te, onload_device=cuda, offload_type="leaf_level",
-                           use_stream=not getattr(torch.version, "hip", None))  # síncrono no ROCm
-    pipe.set_progress_bar_config(disable=True)
-    return pipe
+        # 2) Qwen3-8B: só as 28 primeiras camadas, tensor a tensor, direto para blocos na RAM.
+        te = carregar_qwen3_aparado(os.path.join(pasta, "text_encoder"), dtype, device=dev,
+                                    int8=te_int8, fixar=usar_stream)
+        dispositivo.limpar_memoria()
+        pipe = diffusers.Flux2KleinPipeline.from_pretrained(
+            pasta, text_encoder=te, transformer=transformer, vae=vae, torch_dtype=dtype, local_files_only=True)
+        descarregar_te(te, dev, usar_stream)
+        pipe.set_progress_bar_config(disable=True)
+        return pipe
+    except BaseException:
+        del transformer, vae, te
+        dispositivo.restaurar_vram()
+        liberar_ram_fixada()
+        raise
 
 
 def _main():

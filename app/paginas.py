@@ -1,4 +1,5 @@
 """As abas do programa."""
+import html
 import os
 import shutil
 import subprocess
@@ -17,9 +18,9 @@ from .i18n import tr
 from .modelos import MODELOS, POR_ID
 from .paineis import CampoPrompt, LinhaSemente, PainelResultado, SeletorModelo
 from .widgets import (EXT_IMAGEM, LinhaSlider, Recolhivel, Segmentado, TelaMascara, Visor, botao_icone, carregar_qimage,
-                      copiar_imagem, imagens_do_mime, miniatura, qimage_para_pil, rotulo)
+                      copiar_imagem, imagens_do_mime, mime_tem_imagem, miniatura, qimage_para_pil, rotulo)
 
-FILTRO_IMAGENS = "Imagens (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff)"
+FILTRO_IMAGENS = "Imagens (*.png *.jpg *.jpeg *.jfif *.webp *.bmp *.tif *.tiff *.gif *.avif)"
 
 
 class ErroUsuario(Exception):
@@ -117,10 +118,12 @@ class PaginaTrabalho(QWidget):
         cv.addLayout(rodape)
         h.addWidget(cartao)
 
-        self.resultado = PainelResultado(self.texto_vazio, self.modo != "gerar")
+        self.resultado = PainelResultado(self.texto_vazio, self.modo != "gerar", modo_atual=self.modo)
         self.resultado.enviar.connect(lambda destino, img: self.janela.enviar_para(destino, [img]))
         self.resultado.continuar.connect(self.continuar)
         h.addWidget(self._area_direita(), 1)
+        if hasattr(self, "prompt"):
+            self.prompt.edit.textChanged.connect(self.atualizar_botao)
         self._ao_trocar_modelo(self.seletor.modelo())
 
     # ---- ganchos das subclasses
@@ -148,6 +151,10 @@ class PaginaTrabalho(QWidget):
     def montar_tarefa(self):
         raise NotImplementedError
 
+    def pode_rodar(self):
+        """Checagem barata (roda a cada tecla): só olha se tem o mínimo, sem converter imagens."""
+        return bool(self.prompt.edit.toPlainText().strip())
+
     def colar(self, imgs):
         pass
 
@@ -172,36 +179,34 @@ class PaginaTrabalho(QWidget):
             self.janela.toast(tr("Baixe o modelo {nome} primeiro (aba Modelos).", nome=m["nome"]), "aviso", 4000)
             self.janela.ir_para("modelos")
             return
-        estado = self.janela.estado_modelo(m["id"])
-        if estado != "pronto":
-            # Só gera com o modelo já na placa: o tempo de carregar fica visível e separado da geração.
-            if estado == "fora":
-                self.janela.carregar_modelo(m, self.modo)
-            self.janela.toast(tr("Carregando o modelo… quando ficar pronto, clique em {acao}.", acao=self.texto_botao), "info", 3500)
+        if not self.janela.aceitar_licenca(m):
             return
         try:
             t = self.montar_tarefa()
         except ErroUsuario as e:
-            self.janela.toast(str(e), "aviso")
+            # Se o modelo ainda está fora da placa e faltam dados da tarefa, o clique pré-carrega o modelo;
+            # se o modelo já está pronto (ou o usuário apertou Ctrl+Enter), avisa o que falta preencher.
+            if self.janela.estado_modelo(m["id"]) == "fora":
+                self.janela.carregar_modelo(m, self.modo)
+            else:
+                self.janela.toast(str(e), "aviso")
             return
         t.update(modelo=m["id"], passos=self.passos.valor(), quantas=self.quantas.valor(),
                  semente=self.semente.valor(), guia=self.guia.valor() / 10)
         if t.get("prompt"):
             self.janela.biblioteca.lembrar(self.modo, t["prompt"])
+        # Mesmo se o modelo estiver fora ou terminando de carregar em segundo plano, a fila do motor
+        # abre/conclui o carregamento e já executa a geração na sequência sem exigir um 2º clique.
         self.janela.rodar(t, self)
 
     def _clique_botao(self):
         if self.janela.ocupado and self.janela.dono is self:
             self.janela.cancelar()
             return
-        m = self.seletor.modelo()
-        if self.janela.estado_modelo(m["id"]) == "fora" and config.modelo_instalado(m["id"], excluir=m.get("excluir", ())):
-            self.janela.carregar_modelo(m, self.modo)
-        else:
-            self.executar()
+        self.executar()
 
     def atualizar_botao(self):
-        """O botão principal segue o estado do modelo: Carregar modelo -> Carregando… -> Gerar/Editar."""
+        """Mostra o estado do modelo sem bloquear o clique quando o usuário já quer enfileirar a tarefa."""
         if self.janela.ocupado and self.janela.dono is self:
             return
         m = self.seletor.modelo()
@@ -209,13 +214,15 @@ class PaginaTrabalho(QWidget):
         if estado == "pronto":
             texto, nome, ativo = self.texto_botao, "principal", True
         elif estado == "carregando":
-            texto, nome, ativo = tr("Carregando modelo…"), "principal", False
+            texto, nome, ativo = self.texto_botao, "principal", True
         else:
-            texto, nome, ativo = tr("Carregar modelo"), "principal", True
+            # Se já tem prompt/imagem pronta, mostra direto a ação (vai carregar e rodar num clique só).
+            texto = self.texto_botao if self.pode_rodar() else tr("Carregar modelo")
+            nome, ativo = "principal", True
         self.botao.setText(texto)
         self.botao.setEnabled(ativo)
         self.botao.setToolTip("" if estado == "pronto" else
-                              tr("Carrega {nome} na placa de vídeo (uma vez por sessão). Depois cada imagem sai em segundos.",
+                              tr("Carrega {nome} na placa de vídeo (uma vez por sessão) e executa.",
                                  nome=m["nome"]))
         if self.botao.objectName() != nome:
             self.botao.setObjectName(nome)
@@ -249,7 +256,8 @@ class PaginaTrabalho(QWidget):
         self.resultado.ocupado(False)
         self.atualizar_botao()
         if d:
-            self.semente.ultima = d.get("semente")
+            if d.get("semente") is not None:
+                self.semente.ultima = d.get("semente")
             self.resultado.status(tr("Cancelado") if d.get("cancelado") else d.get("info", ""))
         elif erro:
             self.resultado.status("")
@@ -323,8 +331,8 @@ class PaginaGerar(PaginaTrabalho):
         w, h = self._dimensoes()
         return {"tipo": "gerar", "prompt": self.prompt.texto(), "largura": w, "altura": h}
 
-    def colar(self, imgs):
-        self.janela.enviar_para("editar", imgs)
+    def colar(self, imgs, **_kw):
+        self.janela.enviar_para("editar", imgs, aviso_redirecionamento=True)
 
     def prefs_salvar(self, s):
         super().prefs_salvar(s)
@@ -341,8 +349,10 @@ class PaginaGerar(PaginaTrabalho):
 # ================================================================ Editar
 class ListaReferencias(QListWidget):
     """Imagens de referência: a 1ª é a imagem editada; as outras dão estilo/objetos/rostos.
-    Arraste para reordenar, Delete remove."""
+    Arraste para reordenar ou solte imagens externas do Explorer/Photoshop/navegador; Delete remove."""
     mudou = Signal()
+    externas_soltas = Signal(list)
+    enviar_item = Signal(str, QImage)
 
     def __init__(self):
         super().__init__()
@@ -352,7 +362,8 @@ class ListaReferencias(QListWidget):
         self.setIconSize(QSize(92, 92))
         self.setGridSize(QSize(102, 102))
         self.setMovement(QListWidget.Snap)
-        self.setDragDropMode(QListWidget.InternalMove)
+        self.setDragDropMode(QListWidget.DragDrop)
+        self.setAcceptDrops(True)
         self.setDefaultDropAction(Qt.MoveAction)
         self.setFixedHeight(112)
         self.setResizeMode(QListWidget.Adjust)
@@ -361,6 +372,34 @@ class ListaReferencias(QListWidget):
         self.customContextMenuRequested.connect(self._menu)
         self.model().rowsMoved.connect(lambda *a: self.mudou.emit())
         self._imgs = {}
+
+    def dragEnterEvent(self, e):
+        if e.source() is self:
+            super().dragEnterEvent(e)
+        elif mime_tem_imagem(e.mimeData()):
+            e.acceptProposedAction()
+        else:
+            e.ignore()
+
+    def dragMoveEvent(self, e):
+        if e.source() is self:
+            super().dragMoveEvent(e)
+        elif mime_tem_imagem(e.mimeData()):
+            e.acceptProposedAction()
+        else:
+            e.ignore()
+
+    def dropEvent(self, e):
+        if e.source() is self:
+            super().dropEvent(e)
+            self.mudou.emit()
+            return
+        imgs = imagens_do_mime(e.mimeData())
+        if imgs:
+            self.externas_soltas.emit(imgs)
+            e.acceptProposedAction()
+            return
+        e.ignore()
 
     def adicionar(self, img):
         it = QListWidgetItem()
@@ -380,15 +419,18 @@ class ListaReferencias(QListWidget):
         it = self.item(0)
         self._imgs[it.data(Qt.UserRole)] = img
         it.setIcon(QIcon(miniatura(img, 184)))
+        it.setToolTip(f"{img.width()} × {img.height()}")
         self.mudou.emit()
 
     def imagens(self):
-        return [self._imgs[self.item(i).data(Qt.UserRole)] for i in range(self.count())]
+        return [self._imgs[self.item(i).data(Qt.UserRole)] for i in range(self.count())
+                if self.item(i).data(Qt.UserRole) in self._imgs]
 
     def remover_selecionadas(self):
         for it in self.selectedItems():
             self._imgs.pop(it.data(Qt.UserRole), None)
             self.takeItem(self.row(it))
+        self.setFixedHeight(112 if self.count() <= 3 else 214)
         self.mudou.emit()
 
     def limpar(self):
@@ -407,9 +449,16 @@ class ListaReferencias(QListWidget):
         it = self.itemAt(pos)
         if not it:
             return
+        img = self._imgs.get(it.data(Qt.UserRole))
+        if img is None:
+            return
         m = QMenu(self)
-        m.addAction(tr("Copiar"), lambda: copiar_imagem(self._imgs[it.data(Qt.UserRole)]))
+        m.addAction(tr("Copiar"), lambda: copiar_imagem(img))
         m.addAction(tr("Tornar a principal"), lambda: (self.insertItem(0, self.takeItem(self.row(it))), self.mudou.emit()))
+        m.addSeparator()
+        m.addAction(tr("Mandar para Máscara"), lambda: self.enviar_item.emit("mascara", img))
+        m.addAction(tr("Mandar para Limpar"), lambda: self.enviar_item.emit("limpar", img))
+        m.addSeparator()
         m.addAction(tr("Remover"), lambda: (self.setCurrentItem(it), self.remover_selecionadas()))
         m.exec(self.mapToGlobal(pos))
 
@@ -430,6 +479,7 @@ class PaginaEditar(PaginaTrabalho):
         self.titulo = tr("Editar")
         self.texto_botao = tr("Editar")
         self.texto_vazio = tr("Cole a imagem (Ctrl+V) — direto do Photoshop, navegador ou pasta — ou arraste aqui.")
+        self._chave_base = None
         super().__init__(janela)
 
     def _montar_controles(self):
@@ -441,17 +491,27 @@ class PaginaEditar(PaginaTrabalho):
         topo.addStretch()
         topo.addWidget(botao_icone("colar", tr("Colar (Ctrl+V)"), self.janela.colar_aqui, tamanho=16))
         topo.addWidget(botao_icone("abrir", tr("Abrir arquivos…"), self._abrir, tamanho=16))
-        topo.addWidget(botao_icone("limpar", tr("Remover todas"), lambda: self.refs.limpar(), tamanho=16))
+        self.bt_ir_mascara = botao_icone("mascara", tr("Mandar 1ª imagem para Máscara"),
+                                         lambda: self._enviar_primeira("mascara"), tamanho=16)
+        self.bt_ir_limpar = botao_icone("borracha", tr("Mandar 1ª imagem para Limpar"),
+                                        lambda: self._enviar_primeira("limpar"), tamanho=16)
+        self.bt_ir_mascara.setVisible(False)
+        self.bt_ir_limpar.setVisible(False)
+        topo.addWidget(self.bt_ir_mascara)
+        topo.addWidget(self.bt_ir_limpar)
+        topo.addWidget(botao_icone("limpar", tr("Remover todas"), self._limpar_tudo, tamanho=16))
         v.addLayout(topo)
         self.refs = ListaReferencias()
         self.refs.mudou.connect(self._refs_mudaram)
+        self.refs.externas_soltas.connect(self.colar)
+        self.refs.enviar_item.connect(lambda dest, im: self.janela.enviar_para(dest, [im]))
         v.addWidget(self.refs)
         v.addWidget(rotulo(tr("A 1ª é a imagem editada; as outras servem de referência."), "dica"))
         self.col.addLayout(v)
         self.prompt = CampoPrompt(self.janela.biblioteca, "editar", tr("O que mudar"),
                                   tr("Ex.: troque o fundo por uma praia ao pôr do sol, mantenha a personagem igual"))
         self.col.addWidget(self.prompt)
-        dica = rotulo(tr("Dica: para tirar marca d'água sem mexer no resto, use a aba Máscara."), "dica")
+        dica = rotulo(tr("Dica: para tirar marca d'água ou texto sem mexer no resto, use Máscara ou Limpar."), "dica")
         dica.setWordWrap(True)
         self.col.addWidget(dica)
 
@@ -466,24 +526,61 @@ class PaginaEditar(PaginaTrabalho):
         self.manter_cores.setToolTip(tr("Editando sem máscara o modelo puxa o tom. Isto devolve as cores do original."))
         lay.addWidget(self.manter_cores)
 
+    def _enviar_primeira(self, destino):
+        imgs = self.refs.imagens()
+        if imgs:
+            self.janela.enviar_para(destino, [imgs[0]])
+
+    def _limpar_tudo(self):
+        self._chave_base = None
+        self.refs.limpar()
+        self.resultado.definir_entrada_nova(None)
+
     def _refs_mudaram(self):
         imgs = self.refs.imagens()
-        self.resultado.mostrar_entrada(imgs[0] if imgs else None)
+        tem = bool(imgs)
+        self.bt_ir_mascara.setVisible(tem)
+        self.bt_ir_limpar.setVisible(tem)
+        if not imgs:
+            self._chave_base = None
+            self.resultado.definir_entrada_nova(None)
+        else:
+            nova_chave = imgs[0].cacheKey()
+            if nova_chave != self._chave_base:
+                self._chave_base = nova_chave
+                self.resultado.definir_entrada_nova(imgs[0])
+            else:
+                self.resultado.mostrar_entrada(imgs[0])
+        if hasattr(self, "botao"):
+            self.atualizar_botao()
 
     def _abrir(self):
         ps, _ = QFileDialog.getOpenFileNames(self, tr("Abrir imagens"), "", FILTRO_IMAGENS)
         self.colar([carregar_qimage(p) for p in ps])
 
-    def colar(self, imgs):
-        for img in imgs:
-            if img is not None and not img.isNull():
-                self.refs.adicionar(img)
+    def colar(self, imgs, mascara=None, substituir_base=False):
+        validas = [i for i in imgs if i is not None and not i.isNull()]
+        if not validas:
+            return
+        if substituir_base and self.refs.count() > 0:
+            self.refs.substituir_primeira(validas[0])
+            for extra in validas[1:]:
+                self.refs.adicionar(extra)
+            self.resultado.definir_entrada_nova(validas[0])
+            return
+        estava_vazio = self.refs.count() == 0
+        for img in validas:
+            self.refs.adicionar(img)
+        if estava_vazio:
+            self.resultado.definir_entrada_nova(validas[0])
 
     def continuar(self, img):
         self.refs.substituir_primeira(img)
-        self.resultado.limpar()
-        self.resultado.mostrar_entrada(img)
+        self.resultado.definir_entrada_nova(img)
         self.janela.toast(tr("Resultado virou a nova imagem base"), "ok")
+
+    def pode_rodar(self):
+        return self.refs.count() > 0 and bool(self.prompt.edit.toPlainText().strip())
 
     def montar_tarefa(self):
         imgs = self.refs.imagens()
@@ -574,6 +671,15 @@ class PaginaMascara(PaginaTrabalho):
         fh.addWidget(botao_icone("inverter", tr("Inverter máscara"), self.tela.inverter))
         fh.addWidget(botao_icone("limpar", tr("Limpar máscara"), self.tela.limpar))
         fh.addWidget(botao_icone("ajustar", tr("Ajustar à tela"), self.tela.ajustar))
+        fh.addSpacing(8)
+        self.bt_ir_editar = botao_icone("editar", tr("Mandar para Editar"),
+                                        lambda: self._enviar_tela("editar"))
+        self.bt_ir_limpar = botao_icone("borracha", tr("Mandar para Limpar (mantém a máscara)"),
+                                        lambda: self._enviar_tela("limpar"))
+        self.bt_ir_editar.setVisible(False)
+        self.bt_ir_limpar.setVisible(False)
+        fh.addWidget(self.bt_ir_editar)
+        fh.addWidget(self.bt_ir_limpar)
         barra.addWidget(self.ferramentas)
         barra.addStretch()
         v.addLayout(barra)
@@ -584,9 +690,19 @@ class PaginaMascara(PaginaTrabalho):
         self.tela.mudou.connect(self._sync_ferramenta)
         return w
 
+    def _enviar_tela(self, destino):
+        if self.tela.tem_imagem():
+            msk = self.tela.mascara_pil() if destino == "limpar" and self.tela.tem_mascara() else None
+            self.janela.enviar_para(destino, [self.tela.imagem()], mascara=msk)
+
     def _sync_ferramenta(self):
         self.bt_pincel.setChecked(not self.tela.borracha)
         self.bt_borracha.setChecked(self.tela.borracha)
+        tem = self.tela.tem_imagem()
+        self.bt_ir_editar.setVisible(tem)
+        self.bt_ir_limpar.setVisible(tem)
+        if hasattr(self, "botao"):
+            self.atualizar_botao()
 
     def _ferramenta(self, borracha):
         self.tela.borracha = borracha
@@ -603,18 +719,23 @@ class PaginaMascara(PaginaTrabalho):
         if p:
             self.colar([carregar_qimage(p)])
 
-    def colar(self, imgs):
+    def colar(self, imgs, mascara=None, substituir_base=False):
         if not imgs or imgs[0] is None or imgs[0].isNull():
             return
         img = imgs[0].convertToFormat(QImage.Format_RGB32)
         self.tela.definir_imagem(img)
-        self.resultado.limpar()
-        self.resultado.mostrar_entrada(img)
+        if mascara is not None:
+            self.tela.definir_mascara(mascara)
+        self.resultado.definir_entrada_nova(img)
         self.vista.definir("pintar", True)
+        self._sync_ferramenta()
 
     def continuar(self, img):
         self.colar([img])
         self.janela.toast(tr("Resultado virou a nova imagem base — pinte a próxima área"), "ok")
+
+    def pode_rodar(self):
+        return self.tela.tem_imagem()
 
     def montar_tarefa(self):
         if not self.tela.tem_imagem():
@@ -654,13 +775,15 @@ class PaginaLimpar(QWidget):
     """Apagador rápido para texto, balões e marca d'água: só o LaMa de mangá (não precisa do FLUX).
     Detecta texto/balões sozinho (ou pinte à mão) e limpa em fração de segundo."""
     modo = "limpar"
-    _detectado = Signal(object, str)
+    _detectado = Signal(int, object, object, str)
 
     def __init__(self, janela):
         super().__init__()
         self.janela = janela
         self.texto_botao = tr("Limpar")
         self._detector = None
+        self._cache_det = (None, None)   # (cacheKey da QImage, lista de detecções)
+        self._id_det = 0
         self._detectado.connect(self._ao_detectar)
         h = QHBoxLayout(self)
         h.setContentsMargins(18, 18, 18, 18)
@@ -690,14 +813,14 @@ class PaginaLimpar(QWidget):
         self.botao.setObjectName("principal")
         self.botao.setCursor(Qt.PointingHandCursor)
         self.botao.setMinimumHeight(46)
-        self.botao.clicked.connect(self.executar)
+        self.botao.clicked.connect(self._clique_botao)
         v.addWidget(self.botao)
         d = rotulo(tr("Ctrl+Enter executa · Esc cancela · Ctrl+V cola"), "dica")
         d.setAlignment(Qt.AlignCenter)
         v.addWidget(d)
         h.addWidget(cartao)
 
-        self.resultado = PainelResultado(tr("Veja aqui o resultado."), True)
+        self.resultado = PainelResultado(tr("Veja aqui o resultado."), True, modo_atual="limpar")
         self.resultado.enviar.connect(lambda destino, img: self.janela.enviar_para(destino, [img]))
         self.resultado.continuar.connect(self.continuar)
         direita = QWidget()
@@ -735,6 +858,15 @@ class PaginaLimpar(QWidget):
         fh.addWidget(botao_icone("desfazer", tr("Desfazer (Ctrl+Z)"), self.tela.desfazer))
         fh.addWidget(botao_icone("limpar", tr("Limpar máscara"), self.tela.limpar))
         fh.addWidget(botao_icone("ajustar", tr("Ajustar à tela"), self.tela.ajustar))
+        fh.addSpacing(8)
+        self.bt_ir_editar = botao_icone("editar", tr("Mandar para Editar"),
+                                        lambda: self._enviar_tela("editar"))
+        self.bt_ir_mascara = botao_icone("mascara", tr("Mandar para Máscara (mantém a máscara)"),
+                                         lambda: self._enviar_tela("mascara"))
+        self.bt_ir_editar.setVisible(False)
+        self.bt_ir_mascara.setVisible(False)
+        fh.addWidget(self.bt_ir_editar)
+        fh.addWidget(self.bt_ir_mascara)
         barra.addWidget(self.ferramentas)
         barra.addStretch()
         dv.addLayout(barra)
@@ -742,33 +874,49 @@ class PaginaLimpar(QWidget):
         self.pilha.addWidget(self.tela)
         self.pilha.addWidget(self.resultado)
         dv.addWidget(self.pilha, 1)
-        self.tela.mudou.connect(lambda: (self.bt_pincel.setChecked(not self.tela.borracha),
-                                         self.bt_borracha.setChecked(self.tela.borracha)))
+        self.tela.mudou.connect(self._sync_tela)
         h.addWidget(direita, 1)
+
+    def _sync_tela(self):
+        self.bt_pincel.setChecked(not self.tela.borracha)
+        self.bt_borracha.setChecked(self.tela.borracha)
+        tem = self.tela.tem_imagem()
+        self.bt_ir_editar.setVisible(tem)
+        self.bt_ir_mascara.setVisible(tem)
+
+    def _enviar_tela(self, destino):
+        if self.tela.tem_imagem():
+            msk = self.tela.mascara_pil() if destino == "mascara" and self.tela.tem_mascara() else None
+            self.janela.enviar_para(destino, [self.tela.imagem()], mascara=msk)
 
     def _ferramenta(self, borracha):
         self.tela.borracha = borracha
-        self.bt_pincel.setChecked(not borracha)
-        self.bt_borracha.setChecked(borracha)
+        self._sync_tela()
         self.tela.setFocus()
 
     def _trocar_vista(self, v):
         self.pilha.setCurrentIndex(0 if v == "pintar" else 1)
         self.ferramentas.setVisible(v == "pintar")
+        (self.tela if v == "pintar" else self.resultado.visor).setFocus()
 
     def _abrir(self):
         p, _ = QFileDialog.getOpenFileName(self, tr("Abrir imagem"), "", FILTRO_IMAGENS)
         if p:
             self.colar([carregar_qimage(p)])
 
-    def colar(self, imgs):
+    def colar(self, imgs, mascara=None, substituir_base=False):
         if not imgs or imgs[0] is None or imgs[0].isNull():
             return
+        self._id_det += 1
+        self.bt_detectar.setEnabled(True)
+        self.bt_detectar.setText(tr("Detectar texto automaticamente"))
         img = imgs[0].convertToFormat(QImage.Format_RGB32)
         self.tela.definir_imagem(img)
-        self.resultado.limpar()
-        self.resultado.mostrar_entrada(img)
+        if mascara is not None:
+            self.tela.definir_mascara(mascara)
+        self.resultado.definir_entrada_nova(img)
         self.vista.definir("pintar", True)
+        self._sync_tela()
 
     def continuar(self, img):
         self.colar([img])
@@ -779,25 +927,33 @@ class PaginaLimpar(QWidget):
         if not self.tela.tem_imagem():
             self.janela.toast(tr("Cole ou abra uma imagem primeiro."), "aviso")
             return
+        qimg = self.tela.imagem()
+        chave = qimg.cacheKey()
+        baloes = self.baloes.isChecked()
+        img = qimage_para_pil(qimg)
+        # Reaproveita as caixas já detectadas se a imagem continuar a mesma (ex.: trocou só a opção "balão inteiro").
+        if self._cache_det[0] == chave and self._cache_det[1] is not None and self._detector is not None:
+            mascara = self._detector.mascara_texto(img, incluir_baloes=baloes, deteccoes=self._cache_det[1])
+            self._aplicar_mascara_detectada(mascara)
+            return
+
+        self._id_det += 1
+        meu_id = self._id_det
         self.bt_detectar.setEnabled(False)
         self.bt_detectar.setText(tr("Detectando…"))
-        img, baloes = qimage_para_pil(self.tela.imagem()), self.baloes.isChecked()
-        import threading
+        # A detecção roda no processo do motor (resposta chega em _ao_detectar): a janela não engasga.
+        self.janela.pedir({"tipo": "detectar", "id": meu_id, "imagem": img, "baloes": baloes})
 
-        def trabalho():
-            try:
-                from . import detector
-                if not detector.instalado():
-                    self._detectado.emit(None, tr("Baixando o detector de texto (só na primeira vez)…"))
-                    detector.baixar()
-                if self._detector is None:
-                    self._detector = detector.Detector()
-                self._detectado.emit(self._detector.mascara_texto(img, incluir_baloes=baloes), "")
-            except Exception as e:  # noqa: BLE001
-                self._detectado.emit(None, "erro:" + str(e)[:200])
-        threading.Thread(target=trabalho, daemon=True).start()
+    def _aplicar_mascara_detectada(self, mascara):
+        if mascara is None or mascara.getbbox() is None:
+            self.janela.toast(tr("Nenhum texto encontrado. Pinte à mão o que quer apagar."), "aviso")
+            return
+        self.tela.somar_mascara(mascara)
+        self.janela.toast(tr("Texto marcado. Confira e clique em Limpar."), "ok")
 
-    def _ao_detectar(self, mascara, texto):
+    def _ao_detectar(self, id_det, dets, mascara, texto):
+        if id_det != self._id_det:
+            return
         if mascara is None and texto and not texto.startswith("erro:"):
             self.janela.toast(texto, "info", 4000)
             return
@@ -806,13 +962,20 @@ class PaginaLimpar(QWidget):
         if texto.startswith("erro:"):
             self.janela.toast(tr("A detecção falhou: {e}", e=texto[5:]), "erro", 6000)
             return
-        if mascara is None or mascara.getbbox() is None:
-            self.janela.toast(tr("Nenhum texto encontrado. Pinte à mão o que quer apagar."), "aviso")
-            return
-        self.tela.somar_mascara(mascara)
-        self.janela.toast(tr("Texto marcado. Confira e clique em Limpar."), "ok")
+        if self.tela.tem_imagem() and dets is not None:
+            self._cache_det = (self.tela.imagem().cacheKey(), dets)
+            if self._detector is None:
+                from . import detector
+                self._detector = detector.Detector()  # só desenha máscaras de detecções prontas (sem ONNX)
+        self._aplicar_mascara_detectada(mascara)
 
     # ---- execução
+    def _clique_botao(self):
+        if self.janela.ocupado and self.janela.dono is self:
+            self.janela.cancelar()
+            return
+        self.executar()
+
     def executar(self):
         if self.janela.ocupado:
             return
@@ -826,7 +989,10 @@ class PaginaLimpar(QWidget):
                            "mascara": self.tela.mascara_pil()}, self)
 
     def ao_comecar(self):
-        self.botao.setEnabled(False)
+        self.botao.setText(tr("Cancelar"))
+        self.botao.setObjectName("perigo")
+        self.botao.style().unpolish(self.botao)
+        self.botao.style().polish(self.botao)
         self.resultado.limpar()
         self.resultado.ocupado(True, tr("Limpando…"))
         self.vista.definir("resultado", True)
@@ -841,10 +1007,16 @@ class PaginaLimpar(QWidget):
         self.resultado.adicionar(caminho)
 
     def ao_fim(self, d=None, erro=None):
+        self.botao.setText(self.texto_botao)
+        self.botao.setObjectName("principal")
+        self.botao.style().unpolish(self.botao)
+        self.botao.style().polish(self.botao)
         self.botao.setEnabled(True)
         self.resultado.ocupado(False)
         if d:
-            self.resultado.status(d.get("info", ""))
+            self.resultado.status(tr("Cancelado") if d.get("cancelado") else d.get("info", ""))
+        elif erro:
+            self.resultado.status("")
 
     def atualizar_botao(self):
         pass
@@ -855,6 +1027,12 @@ class PaginaLimpar(QWidget):
         elif self.tela.tem_imagem():
             copiar_imagem(self.tela.imagem())
             self.janela.toast(tr("Imagem copiada — é só colar (Ctrl+V)"), "ok")
+
+    def prefs_salvar(self, s):
+        s.setValue("limpar/baloes", self.baloes.isChecked())
+
+    def prefs_carregar(self, s):
+        self.baloes.setChecked(str(s.value("limpar/baloes", "false")).lower() == "true")
 
 
 # ================================================================ Galeria
@@ -884,6 +1062,7 @@ class PaginaGaleria(QWidget):
         super().__init__()
         self.janela = janela
         self._cache = {}
+        self._itens_por_caminho = {}
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(4)
         self._sinal = _SinalMini()
@@ -898,8 +1077,8 @@ class PaginaGaleria(QWidget):
         topo.addWidget(rotulo(tr("Galeria"), "titulo"))
         topo.addSpacing(16)
         self.filtro = Segmentado([("", tr("Todas")), ("gerar", tr("Gerar")), ("editar", tr("Editar")),
-                                  ("mascara", tr("Máscara"))], "")
-        self.filtro.setFixedWidth(330)
+                                  ("mascara", tr("Máscara")), ("limpar", tr("Limpar"))], "")
+        self.filtro.setFixedWidth(410)
         self.filtro.mudou.connect(lambda _: self._filtrar())
         topo.addWidget(self.filtro)
         topo.addStretch()
@@ -945,6 +1124,7 @@ class PaginaGaleria(QWidget):
         acoes.addWidget(botao_icone("historico", tr("Reusar o prompt"), self._reusar_prompt))
         acoes.addWidget(botao_icone("editar", tr("Mandar para Editar"), lambda: self._enviar("editar")))
         acoes.addWidget(botao_icone("mascara", tr("Mandar para Máscara"), lambda: self._enviar("mascara")))
+        acoes.addWidget(botao_icone("borracha", tr("Mandar para Limpar"), lambda: self._enviar("limpar")))
         acoes.addWidget(botao_icone("abrir", tr("Mostrar na pasta"), self._mostrar_na_pasta))
         acoes.addWidget(botao_icone("lado_a_lado", tr("Comparar com…"), self._comparar_com))
         acoes.addStretch()
@@ -952,6 +1132,7 @@ class PaginaGaleria(QWidget):
         dv.addLayout(acoes)
         h.addWidget(cartao)
 
+        os.makedirs(config.SAIDAS, exist_ok=True)
         self._vigia = QFileSystemWatcher([config.SAIDAS], self)
         self._adiar = QTimer(self, singleShot=True, interval=500)
         self._adiar.timeout.connect(self.recarregar)
@@ -966,10 +1147,22 @@ class PaginaGaleria(QWidget):
     def recarregar(self):
         self._carregado = True
         atual = self.lista.currentItem().data(Qt.UserRole) if self.lista.currentItem() else None
-        arqs = sorted((os.path.join(config.SAIDAS, a) for a in os.listdir(config.SAIDAS) if a.lower().endswith(EXT_IMAGEM)),
-                      key=os.path.getmtime, reverse=True)
+        entradas = []
+        try:
+            with os.scandir(config.SAIDAS) as it_dir:
+                for e in it_dir:
+                    if e.is_file() and e.name.lower().endswith(EXT_IMAGEM):
+                        try:
+                            entradas.append((e.stat().st_mtime, e.path))
+                        except OSError:
+                            pass
+        except OSError:
+            pass
+        entradas.sort(key=lambda x: x[0], reverse=True)
+        arqs = [p for _, p in entradas]
         self.lista.blockSignals(True)
         self.lista.clear()
+        self._itens_por_caminho.clear()
         vazio = QPixmap(170, 170)
         vazio.fill(Qt.transparent)
         for p in arqs:
@@ -983,19 +1176,23 @@ class PaginaGaleria(QWidget):
                 it.setIcon(QIcon(vazio))
                 self._pool.start(_CarregaMini(p, self._sinal))
             self.lista.addItem(it)
+            self._itens_por_caminho[p] = it
             if p == atual:
                 self.lista.setCurrentItem(it)
         self.lista.blockSignals(False)
+        if self.lista.currentItem() is None:
+            self.visor.definir_imagem(None)
+            self.meta.setText("")
         self._filtrar()
 
     def _mini_pronta(self, caminho, img):
         pm = QPixmap.fromImage(img)
+        if len(self._cache) >= 500 and caminho not in self._cache:
+            self._cache.pop(next(iter(self._cache)))
         self._cache[caminho] = pm
-        for i in range(self.lista.count()):
-            it = self.lista.item(i)
-            if it.data(Qt.UserRole) == caminho:
-                it.setIcon(QIcon(pm))
-                break
+        it = self._itens_por_caminho.get(caminho)
+        if it is not None:
+            it.setIcon(QIcon(pm))
 
     def _filtrar(self):
         modo, busca = self.filtro.valor(), self.busca.text().lower().strip()
@@ -1018,15 +1215,20 @@ class PaginaGaleria(QWidget):
         r = QImageReader(p)
         r.setAutoTransform(True)
         img = r.read()
-        self.visor.definir_imagem(img)
+        if img.isNull():
+            img = carregar_qimage(p)
+        self.visor.definir_imagem(img if not img.isNull() else None)
         prompt = r.text("prompt")
-        partes = [f"<b>{os.path.basename(p)}</b>", f"{img.width()} × {img.height()}"]
+        partes = [f"<b>{html.escape(os.path.basename(p))}</b>"]
+        if not img.isNull():
+            partes.append(f"{img.width()} × {img.height()}")
         for chave, rot in (("modelo", tr("Modelo")), ("semente", tr("Semente")), ("passos", tr("Passos"))):
-            if r.text(chave):
-                partes.append(f"{rot}: {r.text(chave)}")
+            val = r.text(chave)
+            if val:
+                partes.append(f"{html.escape(rot)}: {html.escape(val)}")
         texto = " · ".join(partes)
-        if prompt:
-            texto += f"<br><br>{prompt}"
+        if prompt and prompt != "limpar":
+            texto += "<br><br>" + html.escape(prompt).replace("\n", "<br>")
         self.meta.setText(texto)
 
     def copiar(self):
@@ -1046,11 +1248,14 @@ class PaginaGaleria(QWidget):
             return
         r = QImageReader(p)
         prompt, modo = r.text("prompt"), r.text("modo") or "gerar"
+        if modo == "limpar" or prompt == "limpar":
+            self._enviar("limpar")
+            return
         if not prompt:
             self.janela.toast(tr("Esta imagem não tem prompt salvo."), "aviso")
             return
         modo = modo if modo in ("gerar", "editar", "mascara") else "gerar"
-        self.janela.paginas[modo].prompt.definir("" if prompt == "limpar" else prompt)
+        self.janela.paginas[modo].prompt.definir(prompt)
         self.janela.ir_para(modo)
 
     def _mostrar_na_pasta(self):
@@ -1092,13 +1297,14 @@ class PaginaGaleria(QWidget):
         m.addAction(tr("Reusar o prompt"), self._reusar_prompt)
         m.addAction(tr("Mandar para Editar"), lambda: self._enviar("editar"))
         m.addAction(tr("Mandar para Máscara"), lambda: self._enviar("mascara"))
+        m.addAction(tr("Mandar para Limpar"), lambda: self._enviar("limpar"))
         m.addAction(tr("Mostrar na pasta"), self._mostrar_na_pasta)
         m.addAction(tr("Comparar com…"), self._comparar_com)
         m.addSeparator()
         m.addAction(tr("Mandar para a Lixeira"), self._apagar)
         m.exec(self.lista.mapToGlobal(pos))
 
-    def colar(self, imgs):
+    def colar(self, imgs, **_kw):
         self.janela.enviar_para("editar", imgs)
 
 
@@ -1229,6 +1435,9 @@ class CartaoModelo(QFrame):
         self.pagina.janela.modelos_mudaram()
 
     def _apagar(self):
+        if self.pagina.janela.ocupado:
+            self.pagina.janela.toast(tr("Espere terminar ou cancele (Esc) antes."), "aviso")
+            return
         pasta = config.pasta_modelo(self.m["id"])
         externo = os.path.normcase(os.path.abspath(pasta)) != os.path.normcase(os.path.join(config.PASTA_MODELOS, self.m["id"]))
         if externo:
@@ -1239,9 +1448,18 @@ class CartaoModelo(QFrame):
                                  tr("Apagar {nome} do disco ({gb})? Dá para baixar de novo depois.",
                                     nome=self.m["nome"], gb=_gb(config.tamanho_pasta(pasta))))
         if r == QMessageBox.Yes:
-            self.pagina.janela.liberar_placa()
-            shutil.rmtree(pasta, ignore_errors=True)
-            self.pagina.janela.modelos_mudaram()
+            self.bt_apagar.setEnabled(False)
+
+            def _remover():
+                shutil.rmtree(pasta, ignore_errors=True)
+                self.bt_apagar.setEnabled(True)
+                self.pagina.janela.modelos_mudaram()
+                if os.path.isdir(pasta):
+                    self.pagina.janela.toast(tr("Alguns arquivos ainda estavam em uso e não puderam ser apagados."), "aviso", 5000)
+                else:
+                    self.pagina.janela.toast(tr("Modelo apagado do disco."), "ok")
+
+            self.pagina.janela.liberar_placa(ao_terminar=_remover)
 
 
 class PaginaModelos(QWidget):
@@ -1252,6 +1470,7 @@ class PaginaModelos(QWidget):
         fora.setContentsMargins(0, 0, 0, 0)
         rolagem = QScrollArea()
         rolagem.setWidgetResizable(True)
+        rolagem.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         interno = QWidget()
         v = QVBoxLayout(interno)
         v.setContentsMargins(28, 22, 28, 28)
@@ -1282,7 +1501,7 @@ class PaginaModelos(QWidget):
         for c in self.cartoes.values():
             c.atualizar()
 
-    def colar(self, imgs):
+    def colar(self, imgs, **_kw):
         self.janela.enviar_para("editar", imgs)
 
 
@@ -1294,7 +1513,13 @@ class PaginaConfig(QWidget):
         super().__init__()
         self.janela = janela
         self._sinal_atualizacao.connect(self._resposta_atualizacao)
-        v = QVBoxLayout(self)
+        fora = QVBoxLayout(self)
+        fora.setContentsMargins(0, 0, 0, 0)
+        rolagem = QScrollArea()
+        rolagem.setWidgetResizable(True)
+        rolagem.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        interno = QWidget()
+        v = QVBoxLayout(interno)
         v.setContentsMargins(28, 22, 28, 28)
         v.setSpacing(14)
         v.addWidget(rotulo(tr("Configurações"), "titulo"))
@@ -1348,6 +1573,14 @@ class PaginaConfig(QWidget):
         self.placa_dica.setWordWrap(True)
         cv.addWidget(self.placa_dica)
         cv.addWidget(self.pre_carregar)
+        self.bandeja = QCheckBox(tr("Ao fechar a janela, continuar na bandeja com o modelo carregado (reabre na hora)"))
+        self.bandeja.setChecked(config.carregar().get("fechar_para_bandeja", True))
+        self.bandeja.toggled.connect(lambda v: config.salvar({"fechar_para_bandeja": v}))
+        cv.addWidget(self.bandeja)
+        self.com_windows = QCheckBox(tr("Abrir junto com o Windows (escondido na bandeja, já carregando o modelo)"))
+        self.com_windows.setChecked(config.carregar().get("iniciar_com_windows", False))
+        self.com_windows.toggled.connect(self._iniciar_com_windows)
+        cv.addWidget(self.com_windows)
         bt_teste = QPushButton(tr("Testar a placa"))
         bt_teste.setToolTip(tr("Abre o modelo e gera uma imagem pequena, mostrando cada etapa. Salva autoteste.txt na pasta do programa."))
         bt_teste.clicked.connect(self._testar_placa)
@@ -1423,13 +1656,22 @@ class PaginaConfig(QWidget):
             cv.addLayout(h)
         v.addWidget(c)
         v.addStretch()
+        rolagem.setWidget(interno)
+        fora.addWidget(rolagem)
+
+    def _iniciar_com_windows(self, ligar):
+        from . import instancia
+        try:
+            instancia.iniciar_com_windows(ligar)
+            config.salvar({"iniciar_com_windows": ligar})
+        except OSError as e:
+            self.janela.toast(str(e), "erro", 5000)
 
     def _testar_placa(self):
         """Roda `FluxEstudio.py --autoteste` num processo à parte e mostra cada etapa ao vivo."""
         if self.janela.ocupado:
             self.janela.toast(tr("Espere terminar ou cancele (Esc) antes."), "aviso")
             return
-        self.janela.liberar_placa()  # o teste precisa da placa livre
         from PySide6.QtCore import QProcess
         from PySide6.QtWidgets import QDialog, QPlainTextEdit
         d = QDialog(self)
@@ -1452,23 +1694,34 @@ class PaginaConfig(QWidget):
         proc.finished.connect(lambda code, _s: txt.appendPlainText(
             "\n" + (tr("Tudo certo: o modelo roda na placa de vídeo.") if code == 0 else
                     tr("O teste falhou. Mande o arquivo {arq}", arq=os.path.join(config.BASE, "autoteste.txt")))))
-        fechar.clicked.connect(lambda: (proc.kill(), d.accept()))
-        txt.appendPlainText(tr("Rodando o teste (a primeira vez pode levar alguns minutos)…"))
-        QTimer.singleShot(800, lambda: proc.start(py, [os.path.join(config.BASE, "FluxEstudio.py"), "--autoteste"]))
+        estado = {"fechado": False}
+        fechar.clicked.connect(lambda: (estado.__setitem__("fechado", True), proc.kill(), d.accept()))
+        txt.appendPlainText(tr("Liberando a placa de vídeo e iniciando o teste (a primeira vez pode levar alguns minutos)…"))
+
+        def iniciar_proc():
+            if not estado["fechado"]:
+                proc.start(py, [os.path.join(config.BASE, "FluxEstudio.py"), "--autoteste"])
+
+        self.janela.liberar_placa(ao_terminar=iniciar_proc)
         tema.barra_titulo_escura(d)
         d.exec()
+        estado["fechado"] = True
         proc.kill()
+        proc.waitForFinished(1000)
 
     def definir_placa(self, nome, backend, total):
         if nome:
-            self.placa.setText(f"{nome} · {backend} · {total:.0f} GB")
-            dica = tr("Tudo certo: o modelo roda na placa de vídeo.")
-            if total < 7.5:
-                dica = tr("Menos de 8 GB: use os modelos secundários de 8 GB ou tamanhos menores.")
+            suf = f" · {total:.0f} GB" if total else ""
+            self.placa.setText(f"{nome} · {backend}{suf}")
+            if total >= 11.5:
+                dica = tr("Tudo certo: o modelo roda na placa de vídeo.")
+            elif total >= 5.5:
+                dica = tr("Modo econômico ativo: o FLUX.2 4B transmite blocos pela placa sem estourar a memória.")
+            else:
+                dica = tr("Pouca VRAM detectada: use tamanhos menores (768–1024 px) e feche outros programas pesados.")
         else:
             self.placa.setText(tr("Nenhuma placa compatível encontrada · rodando no processador"))
-            tipo = "AMD Radeon (ROCm)" if backend.endswith("ROCm") else "NVIDIA (CUDA)"
-            dica = tr("Vai funcionar, mas muito devagar. Esta versão precisa de placa {tipo}.", tipo=tipo)
+            dica = tr("Vai funcionar no processador, mas bem mais devagar. Placas compatíveis: NVIDIA (CUDA), AMD Radeon (ROCm) e Intel Arc (XPU).")
         self.placa_dica.setText(dica)
 
     # ---- atualização pelo GitHub (roda numa thread do Python; avisa a tela por sinais)
@@ -1502,7 +1755,12 @@ class PaginaConfig(QWidget):
                 mudou = instalacao.instalar_programa(config.BASE)
                 if mudou and os.path.isfile(instalacao.caminho_uv(config.BASE)):
                     s.emit("info", tr("Atualizando as bibliotecas…"))
-                    cmd = instalacao.comandos_instalacao(config.BASE, "cuda")[2][1]  # só o requisitos.txt
+                    info = instalacao.ler_info(config.BASE)
+                    bk = info.get("backend") or "cuda"
+                    gfx = info.get("gfx") or "gfx1201"
+                    if bk not in instalacao.TORCH:
+                        bk = "cuda"
+                    cmd = instalacao.comandos_instalacao(config.BASE, bk, gfx)[2][1]  # só o requisitos.txt, mantendo o backend
                     instalacao.rodar(cmd, config.BASE)
                 instalacao.gravar_info(config.BASE, versao=instalacao.versao_local(config.BASE))
                 s.emit("feito", remota)
@@ -1534,5 +1792,5 @@ class PaginaConfig(QWidget):
         i18n.definir(cod)
         self.bt_reiniciar.setVisible(cod != i18n.atual())
 
-    def colar(self, imgs):
+    def colar(self, imgs, **_kw):
         self.janela.enviar_para("editar", imgs)

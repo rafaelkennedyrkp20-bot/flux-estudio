@@ -1,30 +1,31 @@
 """Janela principal: barra lateral, abas, motor em segundo plano, atalhos globais e colar/arrastar."""
 import logging
 import os
-import queue
 import sys
 import threading
 
-from PySide6.QtCore import (QEasingCurve, QEvent, QObject, QProcess, QPropertyAnimation, QRect, QSettings, QSize, Qt,
-                            QThread, QTimer, Signal)
+from PySide6.QtCore import QEasingCurve, QEvent, QProcess, QPropertyAnimation, QRect, QSettings, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QGuiApplication, QKeySequence
-from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QComboBox, QGraphicsOpacityEffect, QHBoxLayout, QLabel,
-                               QLineEdit, QMainWindow, QPlainTextEdit, QProgressBar, QPushButton, QStackedWidget,
-                               QTextEdit, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QHBoxLayout, QLabel, QLineEdit,
+                               QMainWindow, QPlainTextEdit, QProgressBar, QPushButton, QStackedWidget, QTextEdit,
+                               QVBoxLayout, QWidget)
 
 from . import config, tema
 from .biblioteca import Biblioteca
 from .i18n import tr
 from .modelos import POR_ID, PRINCIPAL
-from .motor import Motor
-from .paginas import (PaginaConfig, PaginaLimpar, PaginaEditar, PaginaGaleria, PaginaGerar, PaginaMascara, PaginaModelos,
+from .processo_motor import MotorRemoto
+from .paginas import (PaginaConfig, PaginaEditar, PaginaGaleria, PaginaGerar, PaginaLimpar, PaginaMascara, PaginaModelos,
                       TrabalhoDownload)
-from .widgets import Toast, botao_icone, imagem_do_mime, imagens_do_mime, rotulo
+from .widgets import Toast, botao_icone, imagens_do_mime, mime_tem_imagem, rotulo
 
 log = logging.getLogger("janela")
 
 ABAS = [("gerar", "Gerar", "gerar"), ("editar", "Editar", "editar"), ("mascara", "Máscara", "mascara"),
-        ("limpar", "Limpar", "borracha"), ("galeria", "Galeria", "galeria"), ("modelos", "Modelos", "modelo"), ("config", "Configurações", "chip")]
+        ("limpar", "Limpar", "borracha"), ("galeria", "Galeria", "galeria"), ("modelos", "Modelos", "modelo"),
+        ("config", "Configurações", "chip")]
+
+NOMES_ABAS = {chave: texto for chave, texto, _ in ABAS}
 
 
 class BarraLateral(QWidget):
@@ -36,6 +37,11 @@ class BarraLateral(QWidget):
         self.setObjectName("barraLateral")
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setFixedWidth(224)
+        self.setAcceptDrops(True)
+        self._aba_arraste = None
+        self._timer_arraste = QTimer(self, singleShot=True, interval=300)
+        self._timer_arraste.timeout.connect(self._ativar_aba_arraste)
+
         v = QVBoxLayout(self)
         v.setContentsMargins(14, 20, 14, 14)
         v.setSpacing(4)
@@ -71,7 +77,7 @@ class BarraLateral(QWidget):
         self.indicador = QWidget(self)
         self.indicador.setStyleSheet(f"background: {tema.ACENTO}; border-radius: 2px;")
         self.indicador.resize(3, 20)
-        self._anim = QPropertyAnimation(self.indicador, b"geometry", self, duration=220,
+        self._anim = QPropertyAnimation(self.indicador, b"geometry", self, duration=180,
                                         easingCurve=QEasingCurve.OutCubic)
 
         # rodapé: placa e memória
@@ -104,6 +110,52 @@ class BarraLateral(QWidget):
         rv.addLayout(h)
         v.addWidget(rod)
 
+    def _aba_em(self, pos):
+        for chave, (b, _) in self.botoes.items():
+            if b.geometry().contains(pos):
+                return chave
+        return None
+
+    def _destacar_arraste(self, chave):
+        if chave == self._aba_arraste:
+            return
+        self._aba_arraste = chave
+        self._timer_arraste.stop()
+        for c, (b, _) in self.botoes.items():
+            ativo = c == chave
+            if bool(b.property("arrastando")) != ativo:
+                b.setProperty("arrastando", ativo)
+                b.style().unpolish(b)
+                b.style().polish(b)
+        if chave in ("editar", "mascara", "limpar"):
+            self._timer_arraste.start()
+
+    def _ativar_aba_arraste(self):
+        if self._aba_arraste in ("editar", "mascara", "limpar"):
+            self.escolhida.emit(self._aba_arraste)
+
+    def dragEnterEvent(self, e):
+        md = e.mimeData()
+        if mime_tem_imagem(md) or md.hasUrls():
+            e.acceptProposedAction()
+
+    def dragMoveEvent(self, e):
+        md = e.mimeData()
+        if mime_tem_imagem(md) or md.hasUrls():
+            self._destacar_arraste(self._aba_em(e.position().toPoint()))
+            e.acceptProposedAction()
+
+    def dragLeaveEvent(self, e):
+        self._destacar_arraste(None)
+        super().dragLeaveEvent(e)
+
+    def dropEvent(self, e):
+        alvo = self._aba_em(e.position().toPoint())
+        self._destacar_arraste(None)
+        destino = alvo if alvo in ("editar", "mascara", "limpar") else "editar"
+        if self.janela.receber_mime(e.mimeData(), destino_forcado=destino):
+            e.acceptProposedAction()
+
     def marcar(self, chave, animar=True):
         for c, (b, ic) in self.botoes.items():
             b.setChecked(c == chave)
@@ -131,16 +183,23 @@ class BarraLateral(QWidget):
 
 
 class JanelaPrincipal(QMainWindow):
-    def __init__(self):
+    _sinal_vram = Signal(float, float)
+
+    def __init__(self, na_bandeja=False):
         super().__init__()
+        self._na_bandeja = na_bandeja
         self.setWindowTitle("Flux Estúdio")
-        self.setMinimumSize(1180, 720)
+        self.setMinimumSize(1024, 640)
         self.prefs = QSettings(config.ARQ_PREFS, QSettings.IniFormat)
         self.biblioteca = Biblioteca()
         self.ocupado = False
         self.dono = None
         self.downloads = {}
         self._torch_pronto = False
+        self._pos_liberar = []
+        self._parar_vram = threading.Event()
+        self._thread_vram = None
+        self._sinal_vram.connect(self._atualizar_barra_vram)
 
         raiz = QWidget()
         raiz.setObjectName("raiz")
@@ -150,8 +209,14 @@ class JanelaPrincipal(QMainWindow):
         self.lateral = BarraLateral(self)
         self.lateral.escolhida.connect(self.ir_para)
         h.addWidget(self.lateral)
+
+        painel_dir = QWidget()
+        vd = QVBoxLayout(painel_dir)
+        vd.setContentsMargins(0, 0, 0, 0)
+        vd.setSpacing(0)
         self.pilha = QStackedWidget()
-        h.addWidget(self.pilha, 1)
+        vd.addWidget(self.pilha, 1)
+        h.addWidget(painel_dir, 1)
         self.setCentralWidget(raiz)
 
         self.paginas = {
@@ -163,18 +228,12 @@ class JanelaPrincipal(QMainWindow):
             self.pilha.addWidget(p)
 
         self._toast = Toast(self)
-        self._cobertura = QLabel(self.pilha)
-        self._cobertura.setAttribute(Qt.WA_TransparentForMouseEvents)
-        self._cobertura.hide()
-        self._ef = QGraphicsOpacityEffect(self._cobertura)
-        self._cobertura.setGraphicsEffect(self._ef)
-        self._anim_aba = QPropertyAnimation(self._ef, b"opacity", self, duration=170, easingCurve=QEasingCurve.OutCubic)
-        self._anim_aba.finished.connect(self._cobertura.hide)
 
-        # Motor numa thread do Python (NÃO QThread): inicializar CUDA numa thread criada pelo Qt
-        # corrompe a memória no Windows e o programa fecha sozinho ao abrir o modelo.
-        self._fila = queue.Queue()
-        self.motor = Motor()
+        # Motor num processo separado (ver processo_motor.py): a janela nunca congela por causa do PyTorch
+        # e nem importa o torch. (Dentro deste processo, CUDA numa QThread corrompia a memória.)
+        self.motor = MotorRemoto()
+        self.motor.vram.connect(self._atualizar_barra_vram)
+        self.motor.detectado.connect(self.paginas["limpar"]._ao_detectar)
         self.motor.estado.connect(self._estado)
         self.motor.passo.connect(self._passo)
         self.motor.imagem.connect(self._imagem)
@@ -183,38 +242,40 @@ class JanelaPrincipal(QMainWindow):
         self.motor.carregado.connect(self.lateral.modelo_aberto)
         self.motor.carregado.connect(self._ao_carregado)
         self.motor.carregando.connect(self._ao_carregando)
+        self.motor.liberado.connect(self._ao_liberado)
         self.modelo_na_placa = ""
         self.modelo_carregando = ""
         self.motor.placa.connect(self._placa)
-        self._trabalhador = threading.Thread(target=self._laco_motor, name="motor", daemon=True)
-        self._trabalhador.start()
         # Depois que a janela aparece: importar o torch disputa o processador com a montagem da tela.
-        QTimer.singleShot(400, lambda: self.pedir({"tipo": "info"}))
-
-        self._monitor = QTimer(self, interval=1500)
-        self._monitor.timeout.connect(self._medir_vram)
+        QTimer.singleShot(350, lambda: self.pedir({"tipo": "info"}))
 
         self.setAcceptDrops(True)
         QApplication.instance().installEventFilter(self)
         self._restaurar()
+        self._criar_bandeja()
+        QTimer.singleShot(400, self._decidir_abertura)  # logo depois do pedido "info" (350 ms), que vai antes na fila
+
+    def _perguntar_ao_abrir(self):
+        """Janela no meio da tela perguntando se liga o modelo agora (escolha pode ser lembrada)."""
+        if self.ocupado or self.modelo_carregando or self.modelo_na_placa or not self.isVisible():
+            return
+        from .carregando import perguntar_ao_abrir
+        carregar, lembrar = perguntar_ao_abrir(self, PRINCIPAL)
+        if lembrar:
+            config.salvar({"ao_abrir": "sempre" if carregar else "nunca"})
+            cfg = self.paginas["config"]
+            cfg.ao_abrir.blockSignals(True)
+            cfg.ao_abrir.setCurrentIndex(1 if carregar else 2)
+            cfg.ao_abrir.blockSignals(False)
+        if carregar:
+            self.carregar_modelo(PRINCIPAL, "editar")
 
     # ------------------------------------------------------------ navegação
     def ir_para(self, chave):
+        if chave not in self.paginas:
+            return
         alvo = self.paginas[chave]
-        atual = self.pilha.currentWidget()
-        if atual is not alvo and self.isVisible():
-            self._cobertura.setPixmap(atual.grab())
-            self._cobertura.setGeometry(0, 0, self.pilha.width(), self.pilha.height())
-            self._ef.setOpacity(1.0)
-            self._cobertura.show()
-            self._cobertura.raise_()
-            self.pilha.setCurrentWidget(alvo)
-            self._anim_aba.stop()
-            self._anim_aba.setStartValue(1.0)
-            self._anim_aba.setEndValue(0.0)
-            self._anim_aba.start()
-        else:
-            self.pilha.setCurrentWidget(alvo)
+        self.pilha.setCurrentWidget(alvo)
         self.lateral.marcar(chave, self.isVisible())
         if chave == "modelos":
             self.paginas["modelos"].atualizar()
@@ -230,15 +291,50 @@ class JanelaPrincipal(QMainWindow):
                 return k
         return "gerar"
 
-    def enviar_para(self, destino, imgs):
-        self.paginas[destino].colar(imgs)
+    def enviar_para(self, destino, imgs, mascara=None, aviso_redirecionamento=False):
+        if destino not in self.paginas:
+            return
+        validas = [i for i in imgs if i is not None and not i.isNull()]
+        if not validas:
+            return
+        estava_em = self.chave_atual()
+        self.paginas[destino].colar(validas, mascara=mascara, substituir_base=True)
         self.ir_para(destino)
+        if aviso_redirecionamento:
+            self.toast(tr("Imagem aberta na aba Editar — use os ícones da barra se quiser Máscara ou Limpar."), "ok", 3400)
+        elif estava_em != destino:
+            nome_aba = tr(NOMES_ABAS.get(destino, destino))
+            self.toast(tr("Imagem enviada para {aba}", aba=nome_aba), "ok", 1800)
+
+    def receber_mime(self, md, destino_forcado=None):
+        """Recebe imagens arrastadas de qualquer lugar da janela (ou sobre o campo de prompt / barra lateral)."""
+        imgs = imagens_do_mime(md)
+        if not imgs:
+            if md is not None and md.hasUrls():
+                self.toast(tr("Formato não suportado ao arrastar. Use PNG/JPG/WebP ou copie (Ctrl+C) no Photoshop e cole (Ctrl+V)."),
+                           "aviso", 4500)
+            return False
+        if destino_forcado in ("editar", "mascara", "limpar"):
+            redirecionou = destino_forcado == "editar" and self.chave_atual() not in ("editar", "mascara", "limpar")
+            self.enviar_para(destino_forcado, imgs, aviso_redirecionamento=redirecionou)
+            return True
+        atual = self.chave_atual()
+        if atual in ("editar", "mascara", "limpar"):
+            self.paginas[atual].colar(imgs)
+            self.toast(tr("Imagem carregada"), "ok", 1500)
+        else:
+            self.enviar_para("editar", imgs, aviso_redirecionamento=True)
+        return True
 
     def colar_aqui(self):
         imgs = imagens_do_mime(QGuiApplication.clipboard().mimeData())
         if imgs:
-            self.pagina_atual().colar(imgs)
-            self.toast(tr("Imagem colada"), "ok", 1400)
+            atual = self.chave_atual()
+            if atual in ("editar", "mascara", "limpar"):
+                self.paginas[atual].colar(imgs)
+                self.toast(tr("Imagem colada"), "ok", 1400)
+            else:
+                self.enviar_para("editar", imgs, aviso_redirecionamento=True)
         else:
             self.toast(tr("Não há imagem na área de transferência. Copie no Photoshop (Ctrl+C) e cole aqui."), "aviso")
 
@@ -247,32 +343,41 @@ class JanelaPrincipal(QMainWindow):
 
     # ------------------------------------------------------------ motor
     def pedir(self, tarefa):
-        self._fila.put(tarefa)
-
-    def _laco_motor(self):
-        while True:
-            tarefa = self._fila.get()
-            if tarefa is None:
-                return
-            self.motor.executar(tarefa)
+        self.motor.enviar(tarefa)
 
     def rodar(self, tarefa, pagina):
         self.ocupado, self.dono = True, pagina
         pagina.ao_comecar()
         self.pedir(tarefa)
+        # Clicou em Gerar/Editar com o modelo fora da placa: a fila carrega e já executa; mostra a espera.
+        if tarefa.get("modelo") and self.estado_modelo(tarefa["modelo"]) != "pronto":
+            self._mostrar_carregando(POR_ID.get(tarefa["modelo"]))
 
     def cancelar(self):
         if self.ocupado:
             self.motor.cancelar = True
-            self.dono.ao_estado(tr("Cancelando…"))
+            if self.dono:
+                self.dono.ao_estado(tr("Cancelando…"))
 
-    def liberar_placa(self):
+    def liberar_placa(self, ao_terminar=None):
         if self.ocupado:
             self.toast(tr("Espere terminar ou cancele (Esc) antes."), "aviso")
             return
+        if callable(ao_terminar):
+            self._pos_liberar.append(ao_terminar)
         self.pedir({"tipo": "liberar"})
 
+    def _ao_liberado(self):
+        pendentes, self._pos_liberar = self._pos_liberar[:], []
+        for fn in pendentes:
+            try:
+                fn()
+            except Exception:  # noqa: BLE001
+                log.exception("erro em callback pós-liberar")
+
     def _estado(self, texto):
+        if getattr(self, "_dlg_carregando", None) is not None:
+            self._dlg_carregando.definir_fase(texto)
         if self.dono:
             self.dono.ao_estado(texto)
         else:  # carregando em segundo plano (ao abrir o programa)
@@ -315,12 +420,42 @@ class JanelaPrincipal(QMainWindow):
         self.lateral.modelo.setText(tr("Carregando {nome}…", nome=m["nome"]))
         self._atualizar_botoes()
         self.pedir({"tipo": "carregar", "modelo": m["id"], "modo": modo})
+        self._mostrar_carregando(m)
+
+    def _mostrar_carregando(self, m):
+        """Janela de espera com etapa, tempo passado e tempo estimado; trava o programa até o modelo ficar pronto."""
+        if m is None or getattr(self, "_dlg_carregando", None) is not None:
+            return
+        from .carregando import DialogoCarregando
+        self._dlg_carregando = DialogoCarregando(self, m, ao_cancelar=self.cancelar_carga)
+        self._dlg_carregando.open()
+
+    def cancelar_carga(self):
+        """Cancelar/X na janela de carga: reinicia o motor (a carga não tem como parar no meio de outro jeito)."""
+        self._dlg_carregando = None
+        self.motor.reiniciar()
+        self.modelo_carregando = ""
+        self.modelo_na_placa = ""
+        dono, self.ocupado, self.dono = self.dono, False, None
+        if dono:
+            dono.ao_fim({"cancelado": True})
+        self._atualizar_botoes()
+        self.lateral.modelo.setText(tr("Nenhum modelo aberto"))
+        self.toast(tr("Carregamento cancelado"), "aviso")
+
+    def _fechar_carregando(self, ok):
+        dlg, self._dlg_carregando = getattr(self, "_dlg_carregando", None), None
+        if dlg is not None:
+            dlg.concluir(ok)
 
     def _ao_carregando(self, id_modelo):
         self.modelo_carregando = id_modelo
         self._atualizar_botoes()
+        self._mostrar_carregando(POR_ID.get(id_modelo))
 
     def _ao_carregado(self, id_modelo):
+        if id_modelo:
+            self._fechar_carregando(True)
         estava = self.modelo_carregando
         self.modelo_carregando = ""
         self.modelo_na_placa = id_modelo
@@ -332,44 +467,8 @@ class JanelaPrincipal(QMainWindow):
         for k in ("gerar", "editar", "mascara"):
             self.paginas[k].atualizar_botao()
 
-    def _perguntar_carregar(self):
-        from PySide6.QtWidgets import QCheckBox, QDialog
-        d = QDialog(self)
-        d.setWindowTitle(tr("Carregar o modelo?"))
-        d.setStyleSheet(f"QDialog {{ background: {tema.PAINEL}; }}")
-        v = QVBoxLayout(d)
-        v.setContentsMargins(24, 22, 24, 20)
-        v.setSpacing(12)
-        v.addWidget(rotulo(tr("Carregar o {nome} agora?", nome=PRINCIPAL["nome"]), "titulo"))
-        txt = rotulo(tr("O modelo vai para a placa de vídeo uma vez (cerca de 30 s a 1 min). Depois cada imagem sai em poucos segundos. "
-                        "Enquanto isso você já pode colar imagens e escrever o prompt."), "subtitulo")
-        txt.setWordWrap(True)
-        v.addWidget(txt)
-        lembrar = QCheckBox(tr("Lembrar minha escolha"))
-        v.addWidget(lembrar)
-        h = QHBoxLayout()
-        h.addStretch()
-        nao = QPushButton(tr("Agora não"))
-        nao.clicked.connect(d.reject)
-        sim = QPushButton(tr("Carregar agora"))
-        sim.setObjectName("principal")
-        sim.setMinimumWidth(170)
-        sim.setDefault(True)
-        sim.clicked.connect(d.accept)
-        h.addWidget(nao)
-        h.addWidget(sim)
-        v.addLayout(h)
-        d.setMinimumWidth(500)
-        tema.barra_titulo_escura(d)
-        ok = d.exec() == QDialog.Accepted
-        if lembrar.isChecked():
-            config.salvar({"ao_abrir": "sempre" if ok else "nunca"})
-            cfg = self.paginas["config"]
-            cfg.ao_abrir.setCurrentIndex(1 if ok else 2)
-        if ok:
-            self.carregar_modelo(PRINCIPAL, "editar")
-
     def _falhou(self, msg):
+        self._fechar_carregando(False)
         if self.modelo_carregando:
             self.modelo_carregando = ""
             self._atualizar_botoes()
@@ -382,31 +481,39 @@ class JanelaPrincipal(QMainWindow):
         self._torch_pronto = bool(nome)
         self._vram_total = total
         if nome:
-            self.lateral.placa.setText(f"{nome}\n{backend} · {total:.0f} GB")
-            self._monitor.start()
-            self._medir_vram()
+            suf = f" · {total:.0f} GB" if total else ""
+            self.lateral.placa.setText(f"{nome}\n{backend}{suf}")
+            if total > 0:
+                self._iniciar_monitor_vram()
+            else:
+                self.lateral.vram.hide()
         else:
             self.lateral.placa.setText(tr("Sem placa compatível (processador)"))
             self.lateral.vram.hide()
         self.paginas["config"].definir_placa(nome, backend, total)
-        # Carregar o modelo é a parte demorada: na abertura o programa pergunta (ou segue a escolha salva).
-        if config.modelo_instalado(PRINCIPAL["id"]):
-            escolha = config.carregar().get("ao_abrir", "perguntar")
-            if escolha == "sempre":
-                self.carregar_modelo(PRINCIPAL, "editar")
-            elif escolha == "perguntar":
-                QTimer.singleShot(250, self._perguntar_carregar)
         self._atualizar_botoes()
 
-    def _medir_vram(self):
-        try:
-            import torch
-            livre, total = torch.cuda.mem_get_info()
-        except Exception:  # noqa: BLE001
+    def _decidir_abertura(self):
+        """Logo que a janela aparece (sem esperar o motor ver a placa): segue a escolha salva ou pergunta.
+        Se carregar, o pedido entra na fila do motor logo atrás da checagem da placa."""
+        if not config.modelo_instalado(PRINCIPAL["id"]) or self.ocupado or self.modelo_carregando or self.modelo_na_placa:
             return
-        usado = total - livre
-        self.lateral.vram.setValue(int(1000 * usado / total))
-        self.lateral.vram_txt.setText(tr("VRAM {u:.1f} de {t:.1f} GB", u=usado / 2**30, t=total / 2**30))
+        escolha = config.carregar().get("ao_abrir", "perguntar")
+        if getattr(self, "_na_bandeja", False):
+            escolha = "sempre"  # aberto junto com o Windows: já deixa o modelo pronto
+        if escolha == "sempre":
+            self.carregar_modelo(PRINCIPAL, "editar")
+        elif escolha == "perguntar":
+            self._perguntar_ao_abrir()
+
+    def _iniciar_monitor_vram(self):
+        """A VRAM é medida no processo do motor e chega pelo sinal motor.vram."""
+
+    def _atualizar_barra_vram(self, usado_gb, total_gb):
+        if total_gb <= 0:
+            return
+        self.lateral.vram.setValue(max(0, min(1000, int(1000 * usado_gb / total_gb))))
+        self.lateral.vram_txt.setText(tr("VRAM {u:.1f} de {t:.1f} GB", u=usado_gb, t=total_gb))
 
     # ------------------------------------------------------------ downloads
     def aceitar_licenca(self, m):
@@ -452,6 +559,8 @@ class JanelaPrincipal(QMainWindow):
             self.downloads[id_modelo][1].b.cancelar()
 
     def _download_fim(self, id_modelo, ok, erro):
+        if id_modelo not in self.downloads:
+            return
         th, _ = self.downloads.pop(id_modelo)
         th.quit()
         th.wait(2000)
@@ -483,8 +592,12 @@ class JanelaPrincipal(QMainWindow):
                 if not em_texto or not md.hasText():
                     imgs = imagens_do_mime(md)
                     if imgs:
-                        self.pagina_atual().colar(imgs)
-                        self.toast(tr("Imagem colada"), "ok", 1200)
+                        atual = self.chave_atual()
+                        if atual in ("editar", "mascara", "limpar"):
+                            self.paginas[atual].colar(imgs)
+                            self.toast(tr("Imagem colada"), "ok", 1200)
+                        else:
+                            self.enviar_para("editar", imgs, aviso_redirecionamento=True)
                         return True
             elif ctrl and k in (Qt.Key_Return, Qt.Key_Enter):
                 p = self.pagina_atual()
@@ -511,13 +624,17 @@ class JanelaPrincipal(QMainWindow):
         return super().eventFilter(obj, e)
 
     def dragEnterEvent(self, e):
-        if imagens_do_mime(e.mimeData()):
+        md = e.mimeData()
+        if mime_tem_imagem(md) or md.hasUrls():
+            e.acceptProposedAction()
+
+    def dragMoveEvent(self, e):
+        md = e.mimeData()
+        if mime_tem_imagem(md) or md.hasUrls():
             e.acceptProposedAction()
 
     def dropEvent(self, e):
-        imgs = imagens_do_mime(e.mimeData())
-        if imgs:
-            self.pagina_atual().colar(imgs)
+        if self.receber_mime(e.mimeData()):
             e.acceptProposedAction()
 
     # ------------------------------------------------------------ janela
@@ -533,39 +650,98 @@ class JanelaPrincipal(QMainWindow):
 
     def _restaurar(self):
         geo = self.prefs.value("janela/geometria")
+        tela = QGuiApplication.primaryScreen()
+        disp = tela.availableGeometry() if tela else QRect(0, 0, 1440, 900)
         if geo is not None:
             self.restoreGeometry(geo)
+            tela_atual = QGuiApplication.screenAt(self.frameGeometry().center()) or tela
+            if tela_atual:
+                disp = tela_atual.availableGeometry()
+                if not disp.intersects(self.frameGeometry().adjusted(40, 40, -40, -40)):
+                    self.resize(min(1440, disp.width() - 40), min(900, disp.height() - 40))
+                    self.move(disp.x() + max(0, (disp.width() - self.width()) // 2),
+                              disp.y() + max(0, (disp.height() - self.height()) // 2))
         else:
-            self.resize(1440, 900)
-        for k in ("gerar", "editar", "mascara"):
+            self.resize(min(1440, max(1024, disp.width() - 60)), min(900, max(640, disp.height() - 60)))
+        for k in ("gerar", "editar", "mascara", "limpar"):
             try:
                 self.paginas[k].prefs_carregar(self.prefs)
             except Exception:  # noqa: BLE001 - preferência estragada não impede abrir
                 log.exception("prefs %s", k)
-        self.ir_para(self.prefs.value("janela/aba", "editar") if self.prefs.value("janela/aba", "editar") in self.paginas else "editar")
+        aba_salva = self.prefs.value("janela/aba", "editar")
+        self.ir_para(aba_salva if aba_salva in self.paginas else "editar")
 
     def _salvar_prefs(self):
         self.prefs.setValue("janela/geometria", self.saveGeometry())
         self.prefs.setValue("janela/aba", self.chave_atual())
-        for k in ("gerar", "editar", "mascara"):
-            self.paginas[k].prefs_salvar(self.prefs)
+        for k in ("gerar", "editar", "mascara", "limpar"):
+            try:
+                self.paginas[k].prefs_salvar(self.prefs)
+            except Exception:  # noqa: BLE001
+                log.exception("salvar prefs %s", k)
         self.prefs.sync()
 
     def reiniciar(self):
+        from . import instancia
         self._salvar_prefs()
+        self._sair_de_verdade = True
+        instancia.parar()
         if getattr(sys, "frozen", False):
             QProcess.startDetached(sys.executable, sys.argv[1:])
         else:
             QProcess.startDetached(sys.executable, [os.path.abspath(sys.argv[0])] + sys.argv[1:])
         self.close()
 
+    # ------------------------------------------------------------ bandeja (fechar = continuar aberto)
+    def _criar_bandeja(self):
+        from PySide6.QtWidgets import QMenu, QSystemTrayIcon
+        self._sair_de_verdade = False
+        self.bandeja = None
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self.bandeja = QSystemTrayIcon(QApplication.instance().windowIcon(), self)
+        self.bandeja.setToolTip("Flux Estúdio")
+        menu = QMenu()
+        menu.addAction(tr("Abrir o Flux Estúdio"), self.trazer_para_frente)
+        menu.addSeparator()
+        menu.addAction(tr("Sair (libera a placa de vídeo)"), self.sair)
+        self.bandeja.setContextMenu(menu)
+        self._menu_bandeja = menu
+        self.bandeja.activated.connect(
+            lambda motivo: self.trazer_para_frente() if motivo in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick) else None)
+        self.bandeja.show()
+
+    def trazer_para_frente(self):
+        self.showNormal() if self.isMinimized() or not self.isVisible() else self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def sair(self):
+        self._sair_de_verdade = True
+        self.close()
+
     def closeEvent(self, e):
+        if (not getattr(self, "_sair_de_verdade", True) and getattr(self, "bandeja", None) is not None
+                and config.carregar().get("fechar_para_bandeja", True)):
+            # Continua rodando escondido: o modelo segue na placa e reabrir é instantâneo.
+            self._salvar_prefs()
+            e.ignore()
+            self.hide()
+            if not config.carregar().get("aviso_bandeja_visto"):
+                config.salvar({"aviso_bandeja_visto": True})
+                self.bandeja.showMessage(
+                    "Flux Estúdio", tr("Continua aberto aqui na bandeja, com o modelo carregado: reabrir é instantâneo. "
+                                       "Para fechar de vez, clique com o botão direito no ícone e escolha Sair."))
+            return
         self._salvar_prefs()
+        self._parar_vram.set()
+        if getattr(self, "bandeja", None) is not None:
+            self.bandeja.hide()
+        self.hide()
         for th, trab in list(self.downloads.values()):
             trab.b.cancelar()
             th.quit()
-            th.wait(3000)
-        self.motor.cancelar = True
-        self._fila.put(None)
-        self._trabalhador.join(3)
+            th.wait(800)
+        # Carregando um modelo o motor não responde ao pedido de parar: fecha na hora em vez de esperar.
+        self.motor.encerrar(0.3 if self.modelo_carregando else 4.0)
         super().closeEvent(e)

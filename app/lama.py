@@ -18,15 +18,16 @@ import time
 import numpy as np
 from PIL import Image
 
-from . import config
+from . import config, dispositivo
 
 log = logging.getLogger("lama")
 
 ID = "lama-manga"
+NOME_ARQ = "anime-manga-big-lama.pt"
 URL = "https://github.com/Sanster/models/releases/download/AnimeMangaInpainting/anime-manga-big-lama.pt"
 TAMANHO = 205_717_870
 PASTA = config.pasta_modelo(ID)
-ARQUIVO = os.path.join(PASTA, "anime-manga-big-lama.pt")
+ARQUIVO = os.path.join(PASTA, NOME_ARQ)
 
 LADO_MAX = 1536     # maior lado do recorte que vai para o modelo
 MULTIPLO = 8        # o LaMa pede lados múltiplos de 8
@@ -41,8 +42,13 @@ class Cancelado(Exception):
 
 # ---------------------------------------------------------------- download
 
+def _arquivo():
+    return os.path.join(config.pasta_modelo(ID), NOME_ARQ)
+
+
 def instalado():
-    return os.path.isfile(ARQUIVO) and os.path.getsize(ARQUIVO) == TAMANHO
+    arq = _arquivo()
+    return os.path.isfile(arq) and os.path.getsize(arq) == TAMANHO
 
 
 def _baixar_arquivo(url, final, tamanho, ao_progresso=None, cancelado=None):
@@ -55,6 +61,8 @@ def _baixar_arquivo(url, final, tamanho, ao_progresso=None, cancelado=None):
     parte = final + ".part"
     nome = os.path.basename(final)
     for tentativa in range(6):
+        if cancelado():
+            raise Cancelado()
         feito = os.path.getsize(parte) if os.path.isfile(parte) else 0
         if feito > tamanho:  # .part estranho: recomeça
             os.remove(parte)
@@ -62,9 +70,15 @@ def _baixar_arquivo(url, final, tamanho, ao_progresso=None, cancelado=None):
         if feito == tamanho:
             break
         try:
-            cab = {"User-Agent": "FluxEstudio/1.0", "Range": f"bytes={feito}-"}
+            cab = {"User-Agent": "FluxEstudio/1.0"}
+            if feito > 0:
+                cab["Range"] = f"bytes={feito}-"
             with requests.get(url, headers=cab, stream=True, timeout=(15, 60)) as r:
-                if r.status_code == 200:  # servidor ignorou o Range: recomeça do zero
+                if r.status_code == 416:  # intervalo inválido: apaga .part e recomeça
+                    if os.path.isfile(parte):
+                        os.remove(parte)
+                    continue
+                if r.status_code == 200:  # servidor ignorou o Range (ou pedido do zero): grava do início
                     feito = 0
                 elif r.status_code != 206:
                     raise IOError(f"HTTP {r.status_code} em {nome}")
@@ -86,7 +100,7 @@ def _baixar_arquivo(url, final, tamanho, ao_progresso=None, cancelado=None):
         except Cancelado:
             raise
         except Exception:
-            if tentativa == 5:
+            if tentativa == 5 or cancelado():
                 raise
             log.warning("falha baixando %s, tentando de novo", nome, exc_info=True)
             time.sleep(2 * (tentativa + 1))
@@ -99,9 +113,10 @@ def _baixar_arquivo(url, final, tamanho, ao_progresso=None, cancelado=None):
 
 def baixar(ao_progresso=None, cancelado=None):
     """Baixa os pesos (se faltarem). Retorna o caminho do arquivo. Levanta Cancelado."""
-    if instalado():
-        return ARQUIVO
-    return _baixar_arquivo(URL, ARQUIVO, TAMANHO, ao_progresso, cancelado)
+    arq = _arquivo()
+    if os.path.isfile(arq) and os.path.getsize(arq) == TAMANHO:
+        return arq
+    return _baixar_arquivo(URL, arq, TAMANHO, ao_progresso, cancelado)
 
 
 # ---------------------------------------------------------------- máscara
@@ -152,34 +167,39 @@ class Lama:
         self.modelo = None
         self.dispositivo = None
 
-    def carregar(self, dispositivo=None):
-        """Abre o TorchScript. dispositivo=None: cuda se houver (e não tiver falhado), senão cpu."""
+    def carregar(self, disp=None):
+        """Abre o TorchScript. disp=None: cuda/xpu se houver (e não tiver falhado), senão cpu."""
         import torch
-        if not instalado():
-            raise FileNotFoundError(ARQUIVO)
-        if dispositivo is None:
-            dispositivo = "cuda" if torch.cuda.is_available() and not _gpu_falhou else "cpu"
-        if self.modelo is not None and self.dispositivo == dispositivo:
+        dispositivo.otimizar_torch()
+        arq = _arquivo()
+        if not (os.path.isfile(arq) and os.path.getsize(arq) == TAMANHO):
+            raise FileNotFoundError(arq)
+        if disp is None:
+            t = dispositivo.tipo()
+            disp = t if t != "cpu" and not _gpu_falhou else "cpu"
+        if self.modelo is not None and self.dispositivo == disp:
             return self
-        modelo = torch.jit.load(ARQUIVO, map_location="cpu")
-        modelo.eval()
-        self.modelo = modelo.to(dispositivo)
-        self.dispositivo = dispositivo
-        log.info("LaMa aberto em %s", dispositivo)
+        if self.modelo is None:
+            modelo = torch.jit.load(arq, map_location="cpu")
+            modelo.eval()
+            self.modelo = modelo
+        self.modelo = self.modelo.to(disp)
+        self.dispositivo = disp
+        log.info("LaMa aberto em %s", disp)
         return self
+
+    def mover_cpu(self):
+        """Recolhe temporariamente os ~200 MB da placa para a CPU sem precisar reler o disco."""
+        if self.modelo is not None and self.dispositivo not in (None, "cpu"):
+            self.modelo = self.modelo.to("cpu")
+            self.dispositivo = "cpu"
+            dispositivo.limpar_memoria()
 
     def descarregar(self):
         """Solta o modelo e devolve a memória da placa."""
-        import gc
         self.modelo = None
         self.dispositivo = None
-        gc.collect()
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
+        dispositivo.limpar_memoria()
 
     def _rodar(self, img, msk):
         """img uint8 HxWx3, msk bool HxW (lados múltiplos de 8) -> uint8 HxWx3."""
@@ -203,11 +223,12 @@ class Lama:
             return self._rodar(img, msk)
         return np.clip(saida * 255 + 0.5, 0, 255).astype(np.uint8)
 
-    def limpar(self, imagem, mascara, dilatar=4, margem=64, pluma=3, lado_max=LADO_MAX, ao_progresso=None):
+    def limpar(self, imagem, mascara, dilatar=4, margem=64, pluma=3, lado_max=LADO_MAX,
+               ao_progresso=None, cancelado=None):
         """Apaga o que está marcado em `mascara` (L, branco = apagar) e devolve a imagem RGB.
         A máscara é dilatada `dilatar` px (halo do texto); fora dela nada muda. A borda é
         misturada em `pluma` px, por dentro da área dilatada. `ao_progresso(i, n)` por região."""
-        if self.modelo is None:
+        if self.modelo is None or (self.dispositivo == "cpu" and dispositivo.tem_gpu() and not _gpu_falhou):
             self.carregar()
         imagem = imagem.convert("RGB")
         if mascara.size != imagem.size:
@@ -221,6 +242,8 @@ class Lama:
         # caixas com folga para a dilatação; dilata e calcula a pluma só dentro de cada recorte
         caixas = _caixas(msk, margem + dilatar)
         for i, (x0, y0, x1, y1) in enumerate(caixas):
+            if cancelado and cancelado():
+                raise Cancelado()
             if ao_progresso:
                 ao_progresso(i, len(caixas))
             rec = orig[y0:y1, x0:x1]
@@ -255,8 +278,8 @@ def _main():
     if "--baixar" in sys.argv or not instalado():
         def mostrar(feito, total, vel, arq):
             print(f"\r{100 * feito / total:5.1f}%  {vel / 2**20:6.1f} MB/s  {arq}", end="", flush=True)
-        baixar(mostrar)
-        print(f"\npronto: {ARQUIVO}")
+        arq = baixar(mostrar)
+        print(f"\npronto: {arq}")
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     if len(args) == 3:
         t0 = time.time()

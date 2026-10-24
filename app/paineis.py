@@ -12,7 +12,8 @@ from . import config, tema
 from .comparar import DialogoComparar
 from .i18n import tr
 from .modelos import para_modo
-from .widgets import FluxoLayout, TiraMiniaturas, Visor, botao_icone, carregar_qimage, copiar_imagem, rotulo
+from .widgets import (FluxoLayout, TiraMiniaturas, Visor, botao_icone, carregar_qimage, copiar_imagem,
+                      mime_tem_imagem, rotulo)
 
 def nome_prompt(p):
     """Prompts que vêm com o programa aparecem no idioma escolhido; os do usuário, como ele salvou."""
@@ -72,6 +73,32 @@ class DialogoPrompt(QDialog):
         return self.nome.text().strip(), self.texto.toPlainText().strip(), self.onde.currentData()
 
 
+class _TextoPrompt(QPlainTextEdit):
+    """Aceita arrastar texto normal, mas se o usuário arrastar uma imagem por cima do campo de prompt,
+    entrega a imagem para a janela principal em vez de colar 'file:///...' no texto."""
+
+    def dragEnterEvent(self, e):
+        if mime_tem_imagem(e.mimeData()):
+            e.acceptProposedAction()
+            return
+        super().dragEnterEvent(e)
+
+    def dragMoveEvent(self, e):
+        if mime_tem_imagem(e.mimeData()):
+            e.acceptProposedAction()
+            return
+        super().dragMoveEvent(e)
+
+    def dropEvent(self, e):
+        if mime_tem_imagem(e.mimeData()):
+            jan = self.window()
+            if hasattr(jan, "receber_mime"):
+                jan.receber_mime(e.mimeData())
+                e.acceptProposedAction()
+                return
+        super().dropEvent(e)
+
+
 # ---------------------------------------------------------------- campo de prompt
 class CampoPrompt(QWidget):
     """Texto do prompt + histórico + prompts salvos como chips (clique usa, Shift+clique acrescenta,
@@ -93,7 +120,7 @@ class CampoPrompt(QWidget):
         topo.addWidget(self.bt_hist)
         topo.addWidget(self.bt_salvar)
         v.addLayout(topo)
-        self.edit = QPlainTextEdit()
+        self.edit = _TextoPrompt()
         self.edit.setPlaceholderText(dica_vazio)
         self.edit.setMinimumHeight(118)
         self.edit.setTabChangesFocus(True)
@@ -260,12 +287,13 @@ class LinhaSemente(QWidget):
 # ---------------------------------------------------------------- painel de resultado
 class PainelResultado(QWidget):
     """Visualizador grande + miniaturas + ações (copiar, salvar, comparar, mandar para outra aba)."""
-    enviar = Signal(str, QImage)       # destino ("editar"/"mascara"), imagem
+    enviar = Signal(str, QImage)       # destino ("editar"/"mascara"/"limpar"), imagem
     continuar = Signal(QImage)         # usar o resultado como nova entrada nesta aba
 
-    def __init__(self, texto_vazio, com_continuar=True):
+    def __init__(self, texto_vazio, com_continuar=True, modo_atual=""):
         super().__init__()
         self._itens = []  # [(QImage, caminho)]
+        self._modo_atual = modo_atual
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(8)
@@ -282,10 +310,11 @@ class PainelResultado(QWidget):
         self.bt_pasta = botao_icone("abrir", tr("Mostrar na pasta"), self._mostrar_na_pasta)
         self.bt_editar = botao_icone("editar", tr("Mandar para Editar"), lambda: self._enviar("editar"))
         self.bt_mascara = botao_icone("mascara", tr("Mandar para Máscara"), lambda: self._enviar("mascara"))
+        self.bt_limpar = botao_icone("borracha", tr("Mandar para Limpar"), lambda: self._enviar("limpar"))
         self.bt_continuar = botao_icone("continuar", tr("Continuar editando este resultado"), self._continuar)
         self._com_continuar = com_continuar
         for b in (self.bt_comparar, self.bt_janela, self.bt_ajustar, self.bt_copiar, self.bt_salvar, self.bt_pasta,
-                  self.bt_editar, self.bt_mascara, self.bt_continuar):
+                  self.bt_editar, self.bt_mascara, self.bt_limpar, self.bt_continuar):
             barra.addWidget(b)
         v.addLayout(barra)
         self.progresso = QProgressBar()
@@ -319,6 +348,18 @@ class PainelResultado(QWidget):
         self.progresso.setValue(feito)
 
     # -- imagens
+    def definir_entrada_nova(self, img):
+        """Quando o usuário traz uma imagem nova (arrastar, colar, enviar de outra aba), limpa resultados
+        anteriores e mostra imediatamente a imagem nova na tela."""
+        self._itens.clear()
+        self.tira.clear()
+        self.tira.setVisible(False)
+        self.info.setText("")
+        self._entrada = img
+        self.visor.definir_antes(img)
+        self.visor.definir_imagem(img, animar=False)
+        self._atualizar_botoes()
+
     def mostrar_entrada(self, img):
         """Antes de ter resultado, mostra a imagem de entrada (e ela vira o "antes" da comparação)."""
         self._entrada = img
@@ -335,6 +376,8 @@ class PainelResultado(QWidget):
         self.tira.setVisible(False)
         if self._entrada is not None:
             self.visor.definir_imagem(self._entrada)
+        else:
+            self.visor.definir_imagem(None)
         self._atualizar_botoes()
 
     def adicionar(self, caminho):
@@ -366,8 +409,11 @@ class PainelResultado(QWidget):
     def _atualizar_botoes(self):
         tem = self.visor.tem_imagem()
         tem_res = bool(self._itens)
-        for b in (self.bt_ajustar, self.bt_copiar, self.bt_salvar, self.bt_editar, self.bt_mascara):
+        for b in (self.bt_ajustar, self.bt_copiar, self.bt_salvar):
             b.setVisible(tem)
+        self.bt_editar.setVisible(tem and self._modo_atual != "editar")
+        self.bt_mascara.setVisible(tem and self._modo_atual != "mascara")
+        self.bt_limpar.setVisible(tem and self._modo_atual != "limpar")
         self.bt_pasta.setVisible(tem_res)
         self.bt_continuar.setVisible(tem_res and self._com_continuar)
         self.bt_comparar.setVisible(tem_res and self._entrada is not None)
