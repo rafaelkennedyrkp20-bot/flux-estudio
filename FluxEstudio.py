@@ -14,7 +14,8 @@ import traceback
 def ajustes_amd():
     """Variáveis de ambiente de estabilidade para placas AMD (ROCm), NVIDIA (CUDA) e Intel antes de importar o torch."""
     from app import dispositivo
-    dispositivo.configurar_ambiente()
+    # A janela não importa o torch: quem escolhe a placa AMD é o processo do motor (ou o autoteste).
+    dispositivo.configurar_ambiente(escolher_placa="--autoteste" in sys.argv)
 
 
 def autoteste():

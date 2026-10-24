@@ -13,8 +13,10 @@ log = logging.getLogger("dispositivo")
 _torch_otimizado = False
 
 
-def configurar_ambiente():
-    """Variáveis de ambiente seguras para AMD (ROCm), NVIDIA (CUDA) e Intel antes de importar o torch."""
+def configurar_ambiente(escolher_placa=True):
+    """Variáveis de ambiente seguras para AMD (ROCm), NVIDIA (CUDA) e Intel antes de importar o torch.
+    escolher_placa: em AMD com vídeo integrado, deixa o PyTorch ver só a placa dedicada (ver _escolher_placa_amd).
+    A janela passa False (não importa o torch); o processo do motor e o autoteste escolhem."""
     # AMD ROCm no Windows: evita busca exaustiva de kernels na 1ª convolução (MIOpen),
     # travamentos de hipBLASLt (RX 9070) e resets de driver (TDR) em transferências DMA pesadas.
     os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
@@ -30,6 +32,60 @@ def configurar_ambiente():
     # Evita avisos/deadlocks de threads do tokenizers e telemetria desnecessária.
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    if escolher_placa:
+        _escolher_placa_amd()
+
+
+# Roda num processo à parte: listar as placas não executa nenhum kernel, então funciona mesmo com o
+# vídeo integrado visível (é justamente o kernel que falha).
+_SONDA = r"""
+import json, torch
+arch = sorted({a.split(":")[0] for a in torch.cuda.get_arch_list()})
+placas = []
+for i in range(torch.cuda.device_count()):
+    p = torch.cuda.get_device_properties(i)
+    placas.append([i, p.name, getattr(p, "gcnArchName", "").split(":")[0], p.total_memory])
+print(json.dumps({"arch": arch, "placas": placas}))
+"""
+
+
+def _escolher_placa_amd():
+    """Ryzen com vídeo integrado (ex.: 9950X, gfx1036) + Radeon dedicada (ex.: RX 9070 XT, gfx1201) no Windows:
+    com as duas visíveis, o ROCm falha em todo kernel com "invalid kernel file" (o pacote do PyTorch só tem
+    kernels da dedicada). Descobre uma vez qual índice é a placa suportada e mais forte e usa
+    HIP_VISIBLE_DEVICES=<índice>. Guarda em config.json; refaz se a versão do PyTorch mudar."""
+    if os.name != "nt" or os.environ.get("HIP_VISIBLE_DEVICES") is not None:
+        return
+    try:
+        from importlib.metadata import version
+        versao_torch = version("torch")
+    except Exception:  # noqa: BLE001
+        return
+    if "rocm" not in versao_torch:
+        return
+    import json
+    import subprocess
+    import sys
+    from . import config
+    salvo = config.carregar().get("placa_amd") or {}
+    if salvo.get("torch") != versao_torch:
+        py = sys.executable.replace("pythonw.exe", "python.exe")
+        try:
+            r = subprocess.run([py, "-c", _SONDA], capture_output=True, text=True, timeout=300,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            d = json.loads(r.stdout.strip().splitlines()[-1])
+        except Exception:  # noqa: BLE001
+            log.warning("não deu para listar as placas AMD", exc_info=True)
+            return
+        placas, visivel = d["placas"], ""
+        if len(placas) > 1:
+            suportadas = [p for p in placas if p[2] in d["arch"]] or placas
+            visivel = str(max(suportadas, key=lambda p: p[3])[0])
+        salvo = {"torch": versao_torch, "visivel": visivel, "placas": [f"{p[1]} ({p[2]})" for p in placas]}
+        config.salvar({"placa_amd": salvo})
+        log.info("placas AMD: %s · arch do PyTorch: %s · usando: %s", salvo["placas"], d["arch"], visivel or "todas")
+    if salvo.get("visivel"):
+        os.environ["HIP_VISIBLE_DEVICES"] = salvo["visivel"]
 
 
 def nucleos_fisicos():
