@@ -12,6 +12,16 @@ from .motor import PROMPT_LIMPAR
 MODOS = ("gerar", "editar", "mascara")
 
 
+# "and any overlaid text" fazia o modelo apagar também o texto dos balões (webtoon/mangá).
+_MARCA_EDITAR = ("Remove only the large semi-transparent watermark (logo or website name) printed over the artwork. "
+                 "Keep all speech bubbles and the text inside them exactly as they are. Everything else stays unchanged.")
+# Textos padrão antigos -> novos: quem já tem o prompts.json recebe a correção, a não ser que tenha editado o texto.
+_TROCAS = {
+    "Remove only the semi-transparent watermark and any overlaid text. Keep everything else exactly the "
+    "same: same composition, colors, lighting and details.": _MARCA_EDITAR,
+}
+
+
 def _padrao():
     return [
         {"nome": "Limpar área", "padrao": True, "modo": "mascara", "texto": PROMPT_LIMPAR},
@@ -19,8 +29,7 @@ def _padrao():
          "texto": "Remove the watermark, logo and any overlaid text inside the masked area. Restore exactly what is "
                   "behind it, continuing the surrounding background, colors and texture seamlessly."},
         {"nome": "Tirar marca d'água", "padrao": True, "modo": "editar",
-         "texto": "Remove only the semi-transparent watermark and any overlaid text. Keep everything else exactly the "
-                  "same: same composition, colors, lighting and details."},
+         "texto": _MARCA_EDITAR},
         {"nome": "Fundo branco de estúdio", "padrao": True, "modo": "editar",
          "texto": "Replace the background with a clean seamless white studio background with soft shadows. Keep the "
                   "subject exactly the same."},
@@ -43,6 +52,13 @@ class Biblioteca(QObject):
                 d = json.load(f)
             self.salvos = d.get("salvos", [])
             self.historico.update(d.get("historico", {}))
+            trocou = False
+            for p in self.salvos:
+                if p.get("padrao") and p.get("texto") in _TROCAS:
+                    p["texto"] = _TROCAS[p["texto"]]
+                    trocou = True
+            if trocou:
+                self._gravar()
         except (OSError, ValueError):
             self.salvos = _padrao()
             self._gravar()
