@@ -516,15 +516,19 @@ class Motor(QObject):
         if self.cancelar:
             self._terminar("mascara", [], "", 0)
             return
-        caixa = caixa_trabalho(mascara, 0.5, 128)
-        rec, rec_m = base.crop(caixa), mascara.crop(caixa)
+        # O FLUX refaz a área pintada + 6 px; a colagem é 100% gerada em toda a área pintada e só esmaece
+        # nessa faixa de fora. Antes a pluma ficava centrada na borda: em letras finas de marca d'água,
+        # 70% dos pixels pintados traziam de volta parte do original (até 68%) — o "fantasma" da marca.
+        area_flux = mascara.filter(ImageFilter.MaxFilter(13))
+        caixa = caixa_trabalho(area_flux, 0.5, 128)
+        rec, rec_m = base.crop(caixa), area_flux.crop(caixa)
         w, h = tamanho_trabalho(rec, m, t.get("maximo"))
         img, msk = rec.resize((w, h), Image.LANCZOS), rec_m.resize((w, h), Image.NEAREST)
         t = dict(t, prompt=t["prompt"].strip() or PROMPT_LIMPAR)
         m, pipe = self._abrir(t["modelo"], "mascara")
         t0 = time.time()
         geradas, s = self._rodar(m, pipe, t, image=img, mask_image=msk, width=w, height=h, strength=float(t["forca"]))
-        pluma = rec_m.filter(ImageFilter.GaussianBlur(3))
+        pluma = mascara.crop(caixa).filter(ImageFilter.MaxFilter(9)).filter(ImageFilter.GaussianBlur(2))
         caminhos = []
         nome = "limpar" if t["prompt"] == PROMPT_LIMPAR else t["prompt"]
         for g, sk in geradas:

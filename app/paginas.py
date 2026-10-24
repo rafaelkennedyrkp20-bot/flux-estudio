@@ -7,7 +7,7 @@ import sys
 
 from PySide6.QtCore import QFileSystemWatcher, QObject, QRunnable, QSize, Qt, QThread, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QIcon, QImage, QImageReader, QPixmap
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
                                QListWidget, QListWidgetItem, QMenu, QMessageBox, QProgressBar, QPushButton,
                                QScrollArea, QStackedWidget, QVBoxLayout, QWidget)
 
@@ -1089,7 +1089,29 @@ class PaginaGaleria(QWidget):
         topo.addWidget(self.busca)
         topo.addWidget(botao_icone("abrir", tr("Abrir a pasta das imagens"), lambda: _abrir_pasta(config.SAIDAS)))
         esq.addLayout(topo)
+        # Seleção: com "Selecionar" ligado, cada clique marca/desmarca; desligado vale Ctrl/Shift+clique e Ctrl+A.
+        marcar = QHBoxLayout()
+        marcar.setSpacing(8)
+        self.bt_selecionar = QPushButton(tr("Selecionar"))
+        self.bt_selecionar.setCheckable(True)
+        self.bt_selecionar.setCursor(Qt.PointingHandCursor)
+        self.bt_selecionar.toggled.connect(self._modo_selecionar)
+        marcar.addWidget(self.bt_selecionar)
+        self.bt_todas = QPushButton(tr("Marcar todas"))
+        self.bt_todas.clicked.connect(self._marcar_todas)
+        marcar.addWidget(self.bt_todas)
+        self.bt_nenhuma = QPushButton(tr("Desmarcar"))
+        self.bt_nenhuma.clicked.connect(lambda: self.lista.clearSelection())
+        marcar.addWidget(self.bt_nenhuma)
+        marcar.addStretch()
+        self.bt_apagar_marcadas = QPushButton()
+        self.bt_apagar_marcadas.setObjectName("perigo")
+        self.bt_apagar_marcadas.setStyleSheet("padding: 6px 14px;")
+        self.bt_apagar_marcadas.clicked.connect(self._apagar)
+        marcar.addWidget(self.bt_apagar_marcadas)
+        esq.addLayout(marcar)
         self.lista = QListWidget()
+        self.lista.setSelectionMode(QListWidget.ExtendedSelection)
         self.lista.setViewMode(QListWidget.IconMode)
         self.lista.setIconSize(QSize(170, 170))
         self.lista.setGridSize(QSize(184, 184))
@@ -1099,6 +1121,7 @@ class PaginaGaleria(QWidget):
         self.lista.setVerticalScrollMode(QListWidget.ScrollPerPixel)
         self.lista.verticalScrollBar().setSingleStep(24)
         self.lista.currentItemChanged.connect(self._selecionar)
+        self.lista.itemSelectionChanged.connect(self._atualizar_marcadas)
         self.lista.itemDoubleClicked.connect(lambda it: self._enviar("editar"))
         self.lista.setContextMenuPolicy(Qt.CustomContextMenu)
         self.lista.customContextMenuRequested.connect(self._menu)
@@ -1138,6 +1161,7 @@ class PaginaGaleria(QWidget):
         self._adiar.timeout.connect(self.recarregar)
         self._vigia.directoryChanged.connect(lambda _: self._adiar.start())
         self._carregado = False
+        self._modo_selecionar(False)
 
     def showEvent(self, e):
         if not self._carregado:
@@ -1205,6 +1229,39 @@ class PaginaGaleria(QWidget):
     def _caminho(self):
         it = self.lista.currentItem()
         return it.data(Qt.UserRole) if it else None
+
+    def _marcadas(self):
+        return [it.data(Qt.UserRole) for it in self.lista.selectedItems() if not it.isHidden()]
+
+    def _modo_selecionar(self, ligado):
+        self.lista.setSelectionMode(QListWidget.MultiSelection if ligado else QListWidget.ExtendedSelection)
+        # marcadas bem visíveis no modo seleção (fundo roxo + borda grossa)
+        self.lista.setStyleSheet(
+            f"QListWidget::item:selected {{ background: rgba(139, 92, 246, 0.33); border: 3px solid {tema.ACENTO}; }}"
+            if ligado else "")
+        for b in (self.bt_todas, self.bt_nenhuma):
+            b.setVisible(ligado)
+        if not ligado:
+            atual = self.lista.currentItem()
+            self.lista.clearSelection()
+            if atual is not None:
+                atual.setSelected(True)
+        self._atualizar_marcadas()
+
+    def _marcar_todas(self):
+        self.lista.blockSignals(True)
+        for i in range(self.lista.count()):
+            it = self.lista.item(i)
+            if not it.isHidden():
+                it.setSelected(True)
+        self.lista.blockSignals(False)
+        self._atualizar_marcadas()
+
+    def _atualizar_marcadas(self):
+        n = len(self._marcadas())
+        self.bt_apagar_marcadas.setText(tr("Apagar {n} marcadas", n=n))
+        self.bt_apagar_marcadas.setVisible(n > 1 or self.bt_selecionar.isChecked())
+        self.bt_apagar_marcadas.setEnabled(n > 0)
 
     def _selecionar(self, it, _ant=None):
         if not it:
@@ -1280,18 +1337,46 @@ class PaginaGaleria(QWidget):
         DialogoComparar(antes, depois, os.path.basename(outro), os.path.basename(p), self.janela).show()
 
     def _apagar(self):
+        """Manda para a Lixeira as marcadas (ou a aberta). Várias de uma vez pedem confirmação."""
         from PySide6.QtCore import QFile
-        p = self._caminho()
-        if p and QFile.moveToTrash(p):
-            self._cache.pop(p, None)
-            self.janela.toast(tr("Enviada para a Lixeira"), "ok")
-            self.recarregar()
+        caminhos = self._marcadas() or ([self._caminho()] if self._caminho() else [])
+        if not caminhos:
+            return
+        if len(caminhos) > 1:
+            r = QMessageBox.question(self, tr("Mandar para a Lixeira"),
+                                     tr("Mandar {n} imagens para a Lixeira? Dá para recuperar pela Lixeira do Windows.",
+                                        n=len(caminhos)))
+            if r != QMessageBox.Yes:
+                return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            feitas = 0
+            for p in caminhos:
+                if QFile.moveToTrash(p):
+                    self._cache.pop(p, None)
+                    feitas += 1
+        finally:
+            QApplication.restoreOverrideCursor()
+        if feitas:
+            self.janela.toast(tr("Enviada para a Lixeira") if feitas == 1
+                              else tr("{n} imagens enviadas para a Lixeira", n=feitas), "ok")
+        if feitas < len(caminhos):
+            self.janela.toast(tr("{n} imagens não puderam ser apagadas (abertas em outro programa?)",
+                                 n=len(caminhos) - feitas), "aviso", 4000)
+        self.recarregar()
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Delete:
+            self._apagar()
+            return
+        super().keyPressEvent(e)
 
     def _menu(self, pos):
         it = self.lista.itemAt(pos)
         if not it:
             return
-        self.lista.setCurrentItem(it)
+        if not it.isSelected():  # clique direito fora das marcadas: vale só esta
+            self.lista.setCurrentItem(it)
         m = QMenu(self)
         m.addAction(tr("Copiar imagem"), self.copiar)
         m.addAction(tr("Reusar o prompt"), self._reusar_prompt)
@@ -1301,7 +1386,8 @@ class PaginaGaleria(QWidget):
         m.addAction(tr("Mostrar na pasta"), self._mostrar_na_pasta)
         m.addAction(tr("Comparar com…"), self._comparar_com)
         m.addSeparator()
-        m.addAction(tr("Mandar para a Lixeira"), self._apagar)
+        n = len(self._marcadas())
+        m.addAction(tr("Mandar {n} marcadas para a Lixeira", n=n) if n > 1 else tr("Mandar para a Lixeira"), self._apagar)
         m.exec(self.lista.mapToGlobal(pos))
 
     def colar(self, imgs, **_kw):
